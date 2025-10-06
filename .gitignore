@@ -1,0 +1,32 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# IDE files
+.idea/
+.vscode/
+
+# Logs and databases
+*.log
+*.sqlite3
+
+# Compiled Python files
+*.pyc
+
+# Dependency directories
+/venv/
+/pip/
+/pipenv/
+*/.venv/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+/test/
+/images/
