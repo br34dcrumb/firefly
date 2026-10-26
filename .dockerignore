@@ -1,0 +1,8 @@
+.git
+.venv
+env
+samples
+firefly-out
+**/__pycache__
+*.egg-info
+.pytest_cache

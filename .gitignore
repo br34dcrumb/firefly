@@ -30,3 +30,10 @@ Thumbs.db
 
 /test/
 /images/
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Firmware samples and scan output never go into git
+/samples/
+/firefly-out/

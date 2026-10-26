@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "firefly-firmware"
+dynamic = ["version"]
+description = "Fast, safe static analysis of firmware images"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["rich>=13.0"]
+
+[project.optional-dependencies]
+extract = ["unblob>=26.3"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+firefly = "firefly.cli:main"
+
+[tool.setuptools]
+packages = ["firefly", "firefly.analyzers", "firefly.data"]
+
+[tool.setuptools.dynamic]
+version = { attr = "firefly.__version__" }
+
+[tool.setuptools.package-data]
+"firefly.data" = ["*.cfg"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
