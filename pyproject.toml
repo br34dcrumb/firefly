@@ -18,13 +18,14 @@ dev = ["pytest>=8"]
 firefly = "firefly.cli:main"
 
 [tool.setuptools]
-packages = ["firefly", "firefly.analyzers", "firefly.data"]
+packages = ["firefly", "firefly.analyzers", "firefly.data", "firefly.emulation"]
 
 [tool.setuptools.dynamic]
 version = { attr = "firefly.__version__" }
 
 [tool.setuptools.package-data]
 "firefly.data" = ["*.cfg"]
+"firefly.emulation" = ["shim/*.c", "shim/Makefile"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

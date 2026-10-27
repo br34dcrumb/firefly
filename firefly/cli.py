@@ -29,6 +29,8 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--no-sbom", action="store_true", help="don't write a CycloneDX SBOM")
     scan.add_argument("--no-html", action="store_true", help="don't write the HTML report")
     scan.add_argument("--sarif", action="store_true", help="also write a SARIF file for CI (e.g. GitHub code scanning)")
+    scan.add_argument("--emulate", action="store_true", help="also run binaries under qemu-user (Linux only; executes untrusted code in a sandbox)")
+    _add_emulation_args(scan)
     scan.add_argument(
         "--min-confidence",
         choices=["low", "medium", "high"],
@@ -38,6 +40,17 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("-q", "--quiet", action="store_true", help="only write the JSON report")
 
     sub.add_parser("analyzers", help="list available analyzers")
+
+    emu = sub.add_parser(
+        "emulate",
+        help="run firmware binaries under qemu-user in a sandbox (Linux only; executes untrusted code)",
+    )
+    emu.add_argument("input", help="firmware image, rootfs tarball, or extracted directory")
+    emu.add_argument("-o", "--output", default="firefly-out", help="output directory (default: %(default)s)")
+    emu.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1, help="parallel extraction workers")
+    emu.add_argument("--backend", choices=["auto", "unblob", "binwalk"], default="auto", help="extraction backend for raw images")
+    emu.add_argument("-q", "--quiet", action="store_true", help="only write the JSON report")
+    _add_emulation_args(emu)
 
     db = sub.add_parser("db", help="manage the offline vulnerability database")
     db_sub = db.add_subparsers(dest="db_command")
@@ -61,6 +74,18 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _add_emulation_args(p: argparse.ArgumentParser) -> None:
+    """Emulation tuning flags shared by `scan` and `emulate`.
+
+    The `--emulate` toggle itself lives only on `scan`; the `emulate` command
+    turns emulation on unconditionally.
+    """
+    p.add_argument("--emulate-timeout", type=float, default=20.0, metavar="SEC", help="wall-clock timeout per binary (default: %(default)s)")
+    p.add_argument("--emulate-max", type=int, default=64, metavar="N", help="max binaries to emulate (default: %(default)s)")
+    p.add_argument("--no-emulate-sandbox", action="store_true", help="run without bubblewrap isolation (resource limits only; unsafe)")
+    p.add_argument("--emulate-shim", action="store_true", help="cross-compile and inject the runtime interception shim if a toolchain is available")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
@@ -79,46 +104,86 @@ def main(argv: list[str] | None = None) -> int:
         return _disclose_command(args)
 
     if args.command == "scan":
-        from firefly import sbom
-        from firefly.pipeline import ScanOptions, scan
-        from firefly.report import print_summary, write_json
+        return _scan_command(args)
 
-        if not os.path.exists(args.input):
-            print(f"firefly: input not found: {args.input}", file=sys.stderr)
-            return 2
-        options = ScanOptions(
-            output_dir=args.output,
-            jobs=args.jobs,
-            backend=args.backend,
-            extract_depth=args.extract_depth,
-            extract_timeout=args.extract_timeout,
-            only=args.only,
-            skip=args.skip,
-            db_path=args.db,
-        )
-        result = scan(args.input, options)
-        report_path = write_json(result)
-        sbom_path = None if args.no_sbom else sbom.write(result)
-        extra = []
-        if not args.no_html:
-            from firefly import htmlreport
-
-            extra.append(("html", htmlreport.write_result(result, os.path.join(result.workdir, "firefly.html"))))
-        if args.sarif:
-            from firefly import sarif
-            from firefly.report import to_dict
-
-            extra.append(("sarif", sarif.write(to_dict(result), os.path.join(result.workdir, "firefly.sarif"))))
-        if args.quiet:
-            print(report_path)
-        else:
-            print_summary(result, report_path, sbom_path, args.min_confidence)
-            for label, path in extra:
-                print(f"{label}: {path}")
-        return 1 if any(e["stage"] == "extract" for e in result.errors) and not result.findings else 0
+    if args.command == "emulate":
+        return _emulate_command(args)
 
     build_parser().print_help()
     return 0
+
+
+def _scan_command(args: argparse.Namespace) -> int:
+    from firefly import sbom
+    from firefly.pipeline import ScanOptions, scan
+    from firefly.report import print_summary, write_json
+
+    if not os.path.exists(args.input):
+        print(f"firefly: input not found: {args.input}", file=sys.stderr)
+        return 2
+    options = ScanOptions(
+        output_dir=args.output,
+        jobs=args.jobs,
+        backend=args.backend,
+        extract_depth=args.extract_depth,
+        extract_timeout=args.extract_timeout,
+        only=args.only,
+        skip=args.skip,
+        db_path=args.db,
+        emulate=args.emulate,
+        emulate_timeout=args.emulate_timeout,
+        emulate_max=args.emulate_max,
+        emulate_sandbox=not args.no_emulate_sandbox,
+        emulate_shim=args.emulate_shim,
+    )
+    result = scan(args.input, options)
+    report_path = write_json(result)
+    sbom_path = None if args.no_sbom else sbom.write(result)
+    extra = []
+    if not args.no_html:
+        from firefly import htmlreport
+
+        extra.append(("html", htmlreport.write_result(result, os.path.join(result.workdir, "firefly.html"))))
+    if args.sarif:
+        from firefly import sarif
+        from firefly.report import to_dict
+
+        extra.append(("sarif", sarif.write(to_dict(result), os.path.join(result.workdir, "firefly.sarif"))))
+    if args.quiet:
+        print(report_path)
+    else:
+        print_summary(result, report_path, sbom_path, args.min_confidence)
+        for label, path in extra:
+            print(f"{label}: {path}")
+    return 1 if any(e["stage"] == "extract" for e in result.errors) and not result.findings else 0
+
+
+def _emulate_command(args: argparse.Namespace) -> int:
+    """Extract + inventory + emulation only (no static analyzers)."""
+    from firefly.pipeline import ScanOptions, scan
+    from firefly.report import print_summary, write_json
+
+    if not os.path.exists(args.input):
+        print(f"firefly: input not found: {args.input}", file=sys.stderr)
+        return 2
+    options = ScanOptions(
+        output_dir=args.output,
+        jobs=args.jobs,
+        backend=args.backend,
+        run_static=False,
+        emulate=True,
+        emulate_timeout=args.emulate_timeout,
+        emulate_max=args.emulate_max,
+        emulate_sandbox=not args.no_emulate_sandbox,
+        emulate_shim=args.emulate_shim,
+    )
+    result = scan(args.input, options)
+    report_path = write_json(result)
+    if args.quiet:
+        print(report_path)
+    else:
+        print_summary(result, report_path, None, "low")
+    return 1 if any(e["stage"] == "extract" for e in result.errors) and not result.findings else 0
 
 
 def _disclose_command(args: argparse.Namespace) -> int:

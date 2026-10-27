@@ -31,6 +31,12 @@ class ScanOptions:
     only: list[str] | None = None
     skip: list[str] = field(default_factory=list)
     db_path: str | None = None
+    run_static: bool = True  # run the static analyzers (off for `firefly emulate`)
+    emulate: bool = False  # opt-in dynamic emulation stage (executes binaries)
+    emulate_timeout: float = 20.0
+    emulate_max: int = 64
+    emulate_sandbox: bool = True  # False == --no-emulate-sandbox
+    emulate_shim: bool = False
 
 
 @dataclass
@@ -105,28 +111,65 @@ def scan(path: str, options: ScanOptions | None = None) -> ScanResult:
         result.inventory = ctx.inventory.stats()
         result.timings["inventory"] = round(time.perf_counter() - t0, 3)
 
-    for analyzer in select_analyzers(options):
-        if analyzer.requires_inventory and ctx.inventory is None:
-            continue
-        t0 = time.perf_counter()
-        try:
-            out = analyzer.run(ctx)
-        except Exception as exc:  # one broken analyzer must not lose the whole scan
-            log.debug("analyzer %s failed", analyzer.name, exc_info=True)
-            result.errors.append({"stage": analyzer.name, "error": f"{type(exc).__name__}: {exc}", "traceback": traceback.format_exc()})
-            continue
-        finally:
-            result.timings[analyzer.name] = round(time.perf_counter() - t0, 3)
-        result.findings.extend(out.findings)
-        result.components.extend(out.components)
-        ctx.components.extend(out.components)
-        result.warnings.extend(out.warnings)
-        if out.artifacts:
-            result.artifacts[analyzer.name] = out.artifacts
+    if options.run_static:
+        for analyzer in select_analyzers(options):
+            if analyzer.requires_inventory and ctx.inventory is None:
+                continue
+            t0 = time.perf_counter()
+            try:
+                out = analyzer.run(ctx)
+            except Exception as exc:  # one broken analyzer must not lose the whole scan
+                log.debug("analyzer %s failed", analyzer.name, exc_info=True)
+                result.errors.append({"stage": analyzer.name, "error": f"{type(exc).__name__}: {exc}", "traceback": traceback.format_exc()})
+                continue
+            finally:
+                result.timings[analyzer.name] = round(time.perf_counter() - t0, 3)
+            result.findings.extend(out.findings)
+            result.components.extend(out.components)
+            ctx.components.extend(out.components)
+            result.warnings.extend(out.warnings)
+            if out.artifacts:
+                result.artifacts[analyzer.name] = out.artifacts
+
+    if options.emulate and ctx.inventory is not None and ctx.extraction is not None:
+        _run_emulation(result, ctx, options)
 
     result.findings.sort(key=lambda f: (-f.severity.rank, not f.metadata.get("kev"), -(f.metadata.get("cvss_score") or 0), f.analyzer, f.title))
     result.finished = _now()
     return result
+
+
+def _run_emulation(result: ScanResult, ctx: ScanContext, options: ScanOptions) -> None:
+    """Run the opt-in dynamic emulation stage, folding its output into the scan.
+
+    Isolated in its own try/except (like an analyzer) so that a failure to
+    emulate never costs the static results.
+    """
+    t0 = time.perf_counter()
+    try:
+        from firefly.emulation import EmulationOptions, run_emulation
+
+        assert ctx.extraction is not None and ctx.inventory is not None
+        emu_opts = EmulationOptions(
+            enabled=True,
+            timeout_s=options.emulate_timeout,
+            max_binaries=options.emulate_max,
+            require_sandbox=options.emulate_sandbox,
+            build_shim=options.emulate_shim,
+            workdir=ctx.workdir,
+        )
+        emu = run_emulation(ctx.extraction.scan_root, ctx.inventory, emu_opts)
+        result.findings.extend(emu.to_findings())
+        result.artifacts["emulation"] = emu.to_artifact()
+        if not emu.available and emu.reason:
+            result.warnings.append(f"emulation skipped: {emu.reason}")
+        elif emu.reason:
+            result.warnings.append(f"emulation: {emu.reason}")
+    except Exception as exc:  # emulation failure must not lose the scan
+        log.debug("emulation stage failed", exc_info=True)
+        result.errors.append({"stage": "emulation", "error": f"{type(exc).__name__}: {exc}", "traceback": traceback.format_exc()})
+    finally:
+        result.timings["emulation"] = round(time.perf_counter() - t0, 3)
 
 
 def _now() -> str:
