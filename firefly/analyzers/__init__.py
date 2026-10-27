@@ -52,12 +52,26 @@ class Analyzer:
 
 
 def builtin_analyzers() -> list[type[Analyzer]]:
+    from firefly.analyzers.accounts import AccountsAnalyzer
+    from firefly.analyzers.credentials import CredentialsAnalyzer
     from firefly.analyzers.cves import CveAnalyzer
+    from firefly.analyzers.dangerfns import DangerousFunctionsAnalyzer
     from firefly.analyzers.entropy import EntropyAnalyzer
+    from firefly.analyzers.hardening import HardeningAnalyzer
+    from firefly.analyzers.services import ServicesAnalyzer
     from firefly.analyzers.versions import VersionAnalyzer
 
     # Order matters: cves consumes the components versions produces.
-    return [EntropyAnalyzer, VersionAnalyzer, CveAnalyzer]
+    return [
+        EntropyAnalyzer,
+        VersionAnalyzer,
+        CveAnalyzer,
+        HardeningAnalyzer,
+        DangerousFunctionsAnalyzer,
+        CredentialsAnalyzer,
+        AccountsAnalyzer,
+        ServicesAnalyzer,
+    ]
 
 
 def all_analyzers() -> list[type[Analyzer]]:

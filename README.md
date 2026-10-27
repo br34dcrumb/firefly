@@ -60,10 +60,10 @@ database lives in `~/.cache/firefly/vulndb.sqlite` (override with `--db` or
 
 ```
 input ─▶ extract ─▶ inventory ─▶ analyzers ─▶ firefly.json
-         unblob     walk once,    entropy        sbom.cdx.json
-         binwalk    hash, type    versions
-         tarfile    every file    cves
-                                  (plugins)
+         unblob     walk once,    entropy      hardening    sbom.cdx.json
+         binwalk    hash, type    versions     dangerfns
+         tarfile    every file    cves         credentials
+                                  (plugins)    accounts, services
 ```
 
 | Stage | What it does |
@@ -73,6 +73,11 @@ input ─▶ extract ─▶ inventory ─▶ analyzers ─▶ firefly.json
 | `entropy` | 4 KiB block entropy profile of the raw image; flags likely-encrypted firmware. |
 | `versions` | Matches ~730 identifier rules (`firefly/data/bin_version_strings.cfg`) against strings of every ELF, in parallel. Names are mapped to NVD vendor/product pairs, duplicates merged, and applet strings inside BusyBox/Toybox are not reported as separate software. |
 | `cves` | Matches components against the local NVD database with firmware-aware version comparison (`0.9.8zh`, `1.0.1g`, `1.0rc1`, `2.0.10-4`). Each hit carries CVSS, CWE, CISA KEV status and a confidence level. |
+| `hardening` | Parses each ELF (no external tools) for exploit mitigations: NX, PIE, RELRO, stack canary. Missing NX is reported per binary; uniform build-default weaknesses are summarized. Network-facing binaries are rated higher. |
+| `dangerfns` | Reports memory-unsafe and command-exec functions a binary actually *imports* (`system`, `popen`, `gets`, `strcpy`, …), from the dynamic symbol table rather than string matching. |
+| `credentials` | Finds hardcoded private keys, passwords and API tokens. **Every value is redacted** before it reaches a finding — reports carry a masked preview, a length and a short fingerprint, never a usable secret. |
+| `accounts` | Reads `/etc/passwd` and `/etc/shadow` (and read-only overlays like `/rom/etc`) for empty passwords, extra UID-0 accounts and weak password-hash *algorithms* (DES, MD5). It never attempts to recover or crack a password; hash values are redacted. |
+| `services` | Flags insecure services started at boot (telnet, rsh, anonymous/writable FTP, SSH permitting root or empty passwords) and the presence of insecure service binaries. |
 
 NVD's version ranges are often broader than the advisories behind them, so the
 `cves` analyzer cross-checks every match that relies only on an open-ended range
@@ -105,7 +110,9 @@ Firmware is attacker-controlled. Firefly:
 - records setuid/setgid bits for analysis but never applies them to disk;
 - never follows symlinks while inventorying, so a firmware `etc/passwd ->
   /etc/passwd` cannot make it read the host's files;
-- isolates analyzer failures so one bad file cannot abort a scan.
+- isolates analyzer failures so one bad file cannot abort a scan;
+- **redacts every secret** it reports, and never attempts to recover, guess or
+  crack a password — it reports only the hash *algorithm* and account policy.
 
 ## Development
 
