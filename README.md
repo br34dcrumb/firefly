@@ -114,6 +114,32 @@ Firmware is attacker-controlled. Firefly:
 - **redacts every secret** it reports, and never attempts to recover, guess or
   crack a password — it reports only the hash *algorithm* and account policy.
 
+## Coordinated disclosure
+
+Firefly can turn a scan into a disclosure package, but it **never contacts a
+vendor** — it prepares drafts for a human to review and send.
+
+```sh
+firefly disclose firefly-out/<scan>/firefly.json --vendor "ACME"   --researcher "Jane Doe <jane@example.org>"
+```
+
+This writes a `disclosure/` folder:
+
+- `advisories/<id>.md` — one advisory draft per issue, with summary, affected
+  files, **redacted** evidence and remediation. No exploit steps are generated.
+- `tracker.json` — a timeline with a per-item deadline (90-day default,
+  `--deadline-days`). The discovery date is preserved across re-scans, so the
+  clock is not reset; set an item's `reported` date and the deadline counts
+  from there.
+- `README.md` — an index of all items.
+
+Already-public CVEs are left out by default (`--include-cves` adds them as
+"update this component" items, since they need no embargo). Vendor-contact
+guidance is offline: Firefly points you at the vendor's `security.txt`, PSIRT
+page and CNA listing, or parses a `security.txt` you have already saved
+(`--security-txt`) — it never fetches one, which would reveal what you are
+analysing.
+
 ## Development
 
 ```sh

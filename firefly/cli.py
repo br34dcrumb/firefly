@@ -46,6 +46,16 @@ def build_parser() -> argparse.ArgumentParser:
     db_sub.add_parser("info", help="show database status")
     for p in (upd, imp, db_sub.choices["info"]):
         p.add_argument("--db", metavar="PATH", help="database path")
+
+    disc = sub.add_parser("disclose", help="prepare coordinated-disclosure advisory drafts from a scan report (never sends)")
+    disc.add_argument("report", help="path to a firefly.json scan report")
+    disc.add_argument("-o", "--output", help="output directory (default: <report dir>/disclosure)")
+    disc.add_argument("--researcher", default="(your name) <you@example.com>", help="reporter name/contact for the advisory header")
+    disc.add_argument("--vendor", help="vendor name, for contact guidance")
+    disc.add_argument("--security-txt", metavar="PATH", help="a saved vendor security.txt to parse (not fetched)")
+    disc.add_argument("--deadline-days", type=int, default=90, help="coordinated-disclosure window in days (default: %(default)s)")
+    disc.add_argument("--min-confidence", choices=["low", "medium", "high"], default="medium", help="lowest confidence to include (default: %(default)s)")
+    disc.add_argument("--include-cves", action="store_true", help="also create remediation items for already-public CVEs")
     return parser
 
 
@@ -62,6 +72,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "db":
         return _db_command(args)
+
+    if args.command == "disclose":
+        return _disclose_command(args)
 
     if args.command == "scan":
         from firefly import sbom
@@ -91,6 +104,65 @@ def main(argv: list[str] | None = None) -> int:
         return 1 if any(e["stage"] == "extract" for e in result.errors) and not result.findings else 0
 
     build_parser().print_help()
+    return 0
+
+
+def _disclose_command(args: argparse.Namespace) -> int:
+    import json
+
+    from firefly import advisory, disclosure
+
+    if not os.path.isfile(args.report):
+        print(f"firefly: report not found: {args.report}", file=sys.stderr)
+        return 2
+    with open(args.report, encoding="utf-8") as fh:
+        report = json.load(fh)
+
+    out_dir = args.output or os.path.join(os.path.dirname(os.path.abspath(args.report)), "disclosure")
+    adv_dir = os.path.join(out_dir, "advisories")
+    os.makedirs(adv_dir, exist_ok=True)
+
+    security_txt = None
+    if args.security_txt:
+        try:
+            with open(args.security_txt, encoding="utf-8") as fh:
+                security_txt = fh.read()
+        except OSError as exc:
+            print(f"firefly: cannot read security.txt: {exc}", file=sys.stderr)
+            return 2
+
+    items = disclosure.build_items(report, min_confidence=args.min_confidence, include_cves=args.include_cves)
+    if not items:
+        print("No disclosable findings at this confidence level.")
+        return 0
+
+    tracker_path = os.path.join(out_dir, "tracker.json")
+    tracker = disclosure.update_tracker(disclosure.load_tracker(tracker_path), items, args.deadline_days)
+    disclosure.save_tracker(tracker, tracker_path)
+
+    target = os.path.basename(report.get("input", {}).get("path", "firmware"))
+    discovered = tracker["updated"]
+    for item in items:
+        entry = tracker["items"][item.id]
+        md = advisory.render_advisory(
+            item,
+            researcher=args.researcher,
+            vendor=args.vendor,
+            discovered=entry["discovered"],
+            deadline=entry["deadline"],
+            security_txt=security_txt,
+        )
+        with open(os.path.join(adv_dir, f"{item.id}.md"), "w", encoding="utf-8") as fh:
+            fh.write(md)
+
+    index = advisory.render_index(items, target=target, discovered=discovered, researcher=args.researcher)
+    with open(os.path.join(out_dir, "README.md"), "w", encoding="utf-8") as fh:
+        fh.write(index)
+
+    print(f"Prepared {len(items)} advisory draft(s) in {out_dir}")
+    print(f"  index:   {os.path.join(out_dir, 'README.md')}")
+    print(f"  tracker: {tracker_path}")
+    print("These are drafts. Review each one and confirm the vendor contact before sending; Firefly sends nothing.")
     return 0
 
 
