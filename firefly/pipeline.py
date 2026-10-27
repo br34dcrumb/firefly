@@ -30,6 +30,7 @@ class ScanOptions:
     extract_timeout: int = 3600
     only: list[str] | None = None
     skip: list[str] = field(default_factory=list)
+    db_path: str | None = None
 
 
 @dataclass
@@ -47,6 +48,7 @@ class ScanResult:
     findings: list[Finding] = field(default_factory=list)
     artifacts: dict[str, Any] = field(default_factory=dict)
     errors: list[dict[str, str]] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 def sha256_file(path: str) -> str:
@@ -80,7 +82,7 @@ def scan(path: str, options: ScanOptions | None = None) -> ScanResult:
     os.makedirs(workdir, exist_ok=True)
 
     result = ScanResult(path, digest, size, workdir, started=_now())
-    ctx = ScanContext(firmware_path=path, workdir=workdir, jobs=max(1, options.jobs))
+    ctx = ScanContext(firmware_path=path, workdir=workdir, jobs=max(1, options.jobs), db_path=options.db_path)
 
     t0 = time.perf_counter()
     try:
@@ -117,10 +119,12 @@ def scan(path: str, options: ScanOptions | None = None) -> ScanResult:
             result.timings[analyzer.name] = round(time.perf_counter() - t0, 3)
         result.findings.extend(out.findings)
         result.components.extend(out.components)
+        ctx.components.extend(out.components)
+        result.warnings.extend(out.warnings)
         if out.artifacts:
             result.artifacts[analyzer.name] = out.artifacts
 
-    result.findings.sort(key=lambda f: (-f.severity.rank, f.analyzer, f.path or ""))
+    result.findings.sort(key=lambda f: (-f.severity.rank, not f.metadata.get("kev"), -(f.metadata.get("cvss_score") or 0), f.analyzer, f.title))
     result.finished = _now()
     return result
 

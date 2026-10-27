@@ -6,6 +6,7 @@ import os
 from concurrent.futures import ProcessPoolExecutor
 
 from firefly.analyzers import Analyzer, AnalyzerResult, ScanContext
+from firefly.components import merge, suppress_multicall
 from firefly.inventory import file_strings
 from firefly.models import Component
 from firefly.versioncfg import VersionRule, load_default_rules
@@ -104,6 +105,9 @@ class VersionAnalyzer(Analyzer):
                 if matched not in comp.evidence and len(comp.evidence) < 5:
                     comp.evidence.append(matched)
 
-        result.components = sorted(components.values(), key=lambda c: (c.product, c.version))
+        kept, suppressed = suppress_multicall(merge(list(components.values())))
+        result.components = kept
         result.artifacts["binaries_scanned"] = len(tasks)
+        if suppressed:
+            result.artifacts["suppressed_multicall"] = [f"{c.product} {c.version}" for c in suppressed]
         return result

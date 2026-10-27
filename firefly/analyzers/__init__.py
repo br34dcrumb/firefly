@@ -27,6 +27,9 @@ class ScanContext:
     jobs: int
     extraction: ExtractionResult | None = None
     inventory: Inventory | None = None
+    db_path: str | None = None
+    # Components found by analyzers that already ran (analyzers run in order).
+    components: list[Component] = field(default_factory=list)
 
 
 @dataclass
@@ -34,6 +37,7 @@ class AnalyzerResult:
     findings: list[Finding] = field(default_factory=list)
     components: list[Component] = field(default_factory=list)
     artifacts: dict[str, Any] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
 
 
 class Analyzer:
@@ -48,10 +52,12 @@ class Analyzer:
 
 
 def builtin_analyzers() -> list[type[Analyzer]]:
+    from firefly.analyzers.cves import CveAnalyzer
     from firefly.analyzers.entropy import EntropyAnalyzer
     from firefly.analyzers.versions import VersionAnalyzer
 
-    return [EntropyAnalyzer, VersionAnalyzer]
+    # Order matters: cves consumes the components versions produces.
+    return [EntropyAnalyzer, VersionAnalyzer, CveAnalyzer]
 
 
 def all_analyzers() -> list[type[Analyzer]]:
