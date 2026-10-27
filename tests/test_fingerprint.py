@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import struct
 
 import firefly.analyzers.fingerprint as analyzer_mod
 from firefly.analyzers.fingerprint import FingerprintAnalyzer
 from firefly.analyzers import ScanContext
 from firefly.fingerprint import FunctionSig, extract_functions
-from firefly.fpdb import FpDB, Identification
+from firefly.fpdb import FpDB, Identification, build_from_manifest
 from firefly.inventory import Inventory
 from firefly.models import Severity
 
@@ -84,6 +85,33 @@ def test_fpdb_identifies_on_overlap(tmp_path):
     db.close()
 
 
+def test_build_from_manifest_defaults_arch_to_elf_machine(tmp_path):
+    # ppc64 (e_machine 0x15) is in inventory's canonical map; a divergent local
+    # map in fpdb would store it under the raw hex "0x15" and never match the
+    # "ppc64" that inventory assigns to a scanned binary.
+    elf = _elf_with_function("deflate", bytes(range(32)), machine=0x15)
+    (tmp_path / "libfoo.so").write_bytes(elf)
+    sig = extract_functions(elf)[0]
+
+    manifest = tmp_path / "m.json"
+    manifest.write_text(json.dumps([{"path": "libfoo.so", "product": "foo", "version": "1.0"}]))
+    info = build_from_manifest(str(tmp_path / "fp.sqlite"), str(manifest))
+    assert info["signatures"] == "1"
+
+    db = FpDB(str(tmp_path / "fp.sqlite"))
+    assert [i.product for i in db.identify({sig.hash}, "ppc64", min_matched=1)] == ["foo"]
+    assert db.identify({sig.hash}, "0x15", min_matched=1) == []  # not stored under raw hex
+    db.close()
+
+
+def test_build_from_manifest_reports_skipped(tmp_path):
+    manifest = tmp_path / "m.json"
+    manifest.write_text(json.dumps([{"path": "missing.bin", "product": "x", "version": "1"}]))
+    info = build_from_manifest(str(tmp_path / "fp.sqlite"), str(manifest))
+    assert info["signatures"] == "0"
+    assert "not found" in info.get("skipped", "")
+
+
 def test_fpdb_respects_arch_and_thresholds(tmp_path):
     db = FpDB(str(tmp_path / "fp.sqlite"))
     hashes = [f"{i:032x}" for i in range(10)]
@@ -123,6 +151,26 @@ def test_analyzer_emits_component_and_finding(tmp_path, monkeypatch):
     assert res.components[0].paths == ["bin/httpd"]
     assert any(f.severity is Severity.INFO and "zlib" in f.title for f in res.findings)
     assert res.artifacts["binaries_fingerprinted"] == 1
+
+
+def test_analyzer_keeps_one_version_per_product(tmp_path, monkeypatch):
+    # Two close versions of one product share most functions; the binary must be
+    # reported as one component (the best-matching version), not one per version.
+    dbfile = tmp_path / "fp.sqlite"
+    db = FpDB(str(dbfile))
+    common = [f"{i:032x}" for i in range(8)]
+    db.add(hashes=common + ["a" * 32, "b" * 32], arch="arm", vendor="zlib", product="zlib", version="1.2.11")
+    db.add(hashes=common + ["c" * 32, "d" * 32], arch="arm", vendor="zlib", product="zlib", version="1.2.12")
+    db.close()
+
+    bin_hashes = common + ["a" * 32, "b" * 32]  # exactly 1.2.11; overlaps 8/10 of 1.2.12
+    monkeypatch.setattr(
+        analyzer_mod, "extract_functions_file",
+        lambda path: [FunctionSig(name=f"f{i}", size=32, hash=h) for i, h in enumerate(bin_hashes)],
+    )
+
+    res = FingerprintAnalyzer().run(_ctx(tmp_path, str(dbfile)))
+    assert [(c.product, c.version) for c in res.components] == [("zlib", "1.2.11")]
 
 
 def test_analyzer_without_db_warns(tmp_path):

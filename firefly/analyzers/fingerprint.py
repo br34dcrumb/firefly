@@ -40,7 +40,15 @@ class FingerprintAnalyzer(Analyzer):
                     continue
                 scanned += 1
                 hashes = {s.hash for s in sigs}
+                # identify() returns every reference build over threshold, best
+                # first; close versions of one product share most functions, so
+                # keep only the strongest version per product to avoid emitting
+                # a component (and CVEs) for a version that isn't present.
+                seen: set[tuple[str | None, str]] = set()
                 for ident in db.identify(hashes, rec.elf.machine):
+                    if (ident.vendor, ident.product) in seen:
+                        continue
+                    seen.add((ident.vendor, ident.product))
                     raw.append(
                         Component(
                             product=ident.product,
