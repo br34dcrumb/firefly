@@ -99,7 +99,7 @@ def _rlimits(policy: SandboxPolicy):
     return apply
 
 
-def _bwrap_prefix(rootfs: str, extra_ro: list[str], rw_binds: list[str]) -> list[str]:
+def _bwrap_prefix(rootfs: str, extra_ro: list[str], rw_binds: list[str], allow_network: bool) -> list[str]:
     """Build the ``bwrap ... --`` prefix that precedes the qemu command.
 
     Only the host's system-code directories are mounted read-only (so qemu and
@@ -107,14 +107,22 @@ def _bwrap_prefix(rootfs: str, extra_ro: list[str], rw_binds: list[str]) -> list
     The scan root, the qemu binary and the shim are bound read-only explicitly
     (they may live outside those dirs, e.g. under the output directory), and
     ``/tmp``, ``/run`` and ``/var/tmp`` are fresh tmpfs so a firmware process
-    has somewhere to write without touching the host. ``--unshare-all`` includes
-    the network namespace, so there is no egress. ``rw_binds`` are the only
+    has somewhere to write without touching the host. ``rw_binds`` are the only
     writable host paths (the shim's observation log), bound read-write so we can
     read events back afterwards.
+
+    ``allow_network`` controls the network namespace. Phase A (user-mode) sets
+    it False, so ``--unshare-all`` blocks all egress. Phase B (full-system)
+    sets it True: qemu's user-mode (slirp) network needs the host namespace so
+    forwarded ports are reachable, and slirp itself NATs the guest with no raw
+    host access — so every namespace *except* net is still unshared.
     """
-    cmd = [
-        "bwrap",
-        "--unshare-all",
+    cmd = ["bwrap"]
+    if allow_network:
+        cmd += ["--unshare-user-try", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try"]
+    else:
+        cmd += ["--unshare-all"]
+    cmd += [
         "--die-with-parent",
         "--dev", "/dev",
         "--proc", "/proc",
@@ -140,13 +148,16 @@ def build_command(
     inner: list[str],
     extra_ro: list[str] | None = None,
     rw_binds: list[str] | None = None,
+    allow_network: bool = False,
 ):
     """Wrap ``inner`` (the qemu command) for the chosen tier.
 
     Returns ``(argv, preexec_fn)``. ``preexec_fn`` is None under bwrap (the
     namespace already constrains the process) and on non-POSIX hosts.
+    ``allow_network`` keeps the host network namespace (Phase B slirp); it is
+    ignored in the rlimit-only tier, which never had network isolation.
     """
     if tier == "bwrap":
-        return _bwrap_prefix(rootfs, extra_ro or [], rw_binds or []) + inner, None
+        return _bwrap_prefix(rootfs, extra_ro or [], rw_binds or [], allow_network) + inner, None
     # rlimit-only
     return inner, _rlimits(policy)

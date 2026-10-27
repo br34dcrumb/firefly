@@ -30,7 +30,9 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--no-html", action="store_true", help="don't write the HTML report")
     scan.add_argument("--sarif", action="store_true", help="also write a SARIF file for CI (e.g. GitHub code scanning)")
     scan.add_argument("--emulate", action="store_true", help="also run binaries under qemu-user (Linux only; executes untrusted code in a sandbox)")
+    scan.add_argument("--emulate-system", action="store_true", help="also attempt a full-system boot under qemu-system (Linux only)")
     _add_emulation_args(scan)
+    _add_system_args(scan)
     scan.add_argument(
         "--min-confidence",
         choices=["low", "medium", "high"],
@@ -50,7 +52,9 @@ def build_parser() -> argparse.ArgumentParser:
     emu.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1, help="parallel extraction workers")
     emu.add_argument("--backend", choices=["auto", "unblob", "binwalk"], default="auto", help="extraction backend for raw images")
     emu.add_argument("-q", "--quiet", action="store_true", help="only write the JSON report")
+    emu.add_argument("--system", action="store_true", help="full-system boot under qemu-system instead of per-binary qemu-user")
     _add_emulation_args(emu)
+    _add_system_args(emu)
 
     db = sub.add_parser("db", help="manage the offline vulnerability database")
     db_sub = db.add_subparsers(dest="db_command")
@@ -85,6 +89,18 @@ def _add_emulation_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--emulate-arg", action="append", default=[], metavar="ARG", help="argument to pass to each emulated binary (repeatable)")
     p.add_argument("--no-emulate-sandbox", action="store_true", help="run without bubblewrap isolation (resource limits only; unsafe)")
     p.add_argument("--emulate-shim", action="store_true", help="cross-compile and inject the runtime interception shim if a toolchain is available")
+
+
+def _add_system_args(p: argparse.ArgumentParser) -> None:
+    """Full-system (Phase B) tuning flags, shared by `scan` and `emulate`."""
+    p.add_argument("--system-timeout", type=float, default=90.0, metavar="SEC", help="full-system boot timeout (default: %(default)s)")
+    p.add_argument("--system-kernel", metavar="PATH", help="kernel image to boot (else auto-detected in the image)")
+    p.add_argument("--system-machine", metavar="M", help="qemu -M machine type (else a per-arch default)")
+    p.add_argument("--system-dtb", metavar="PATH", help="device tree blob to pass to qemu")
+    p.add_argument("--system-nic", metavar="MODEL", help="NIC device model for slirp networking")
+    p.add_argument("--system-append", metavar="CMDLINE", help="kernel command line (overrides the default)")
+    p.add_argument("--system-image", metavar="PATH", help="prebuilt root disk image (else one is built from the rootfs)")
+    p.add_argument("--system-initrd", metavar="PATH", help="initramfs to boot (bypasses needing a disk driver in the kernel)")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -137,6 +153,15 @@ def _scan_command(args: argparse.Namespace) -> int:
         emulate_sandbox=not args.no_emulate_sandbox,
         emulate_shim=args.emulate_shim,
         emulate_args=tuple(args.emulate_arg),
+        emulate_system=args.emulate_system,
+        emulate_system_timeout=args.system_timeout,
+        emulate_kernel=args.system_kernel,
+        emulate_machine=args.system_machine,
+        emulate_dtb=args.system_dtb,
+        emulate_nic=args.system_nic,
+        emulate_append=args.system_append,
+        emulate_image=args.system_image,
+        emulate_initrd=args.system_initrd,
     )
     result = scan(args.input, options)
     report_path = write_json(result)
@@ -173,12 +198,21 @@ def _emulate_command(args: argparse.Namespace) -> int:
         jobs=args.jobs,
         backend=args.backend,
         run_static=False,
-        emulate=True,
+        emulate=not args.system,
         emulate_timeout=args.emulate_timeout,
         emulate_max=args.emulate_max,
         emulate_sandbox=not args.no_emulate_sandbox,
         emulate_shim=args.emulate_shim,
         emulate_args=tuple(args.emulate_arg),
+        emulate_system=args.system,
+        emulate_system_timeout=args.system_timeout,
+        emulate_kernel=args.system_kernel,
+        emulate_machine=args.system_machine,
+        emulate_dtb=args.system_dtb,
+        emulate_nic=args.system_nic,
+        emulate_append=args.system_append,
+        emulate_image=args.system_image,
+        emulate_initrd=args.system_initrd,
     )
     result = scan(args.input, options)
     report_path = write_json(result)

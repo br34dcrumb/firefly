@@ -10,5 +10,9 @@ from __future__ import annotations
 
 from firefly.emulation.result import BinaryRun, EmulationResult
 from firefly.emulation.stage import EmulationOptions, run_emulation
+from firefly.emulation.system import SystemBootResult, SystemOptions, run_system
 
-__all__ = ["BinaryRun", "EmulationResult", "EmulationOptions", "run_emulation"]
+__all__ = [
+    "BinaryRun", "EmulationResult", "EmulationOptions", "run_emulation",
+    "SystemBootResult", "SystemOptions", "run_system",
+]

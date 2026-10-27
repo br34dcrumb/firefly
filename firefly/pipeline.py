@@ -38,6 +38,16 @@ class ScanOptions:
     emulate_sandbox: bool = True  # False == --no-emulate-sandbox
     emulate_shim: bool = False
     emulate_args: tuple[str, ...] = ()
+    # Phase B: full-system emulation
+    emulate_system: bool = False
+    emulate_system_timeout: float = 90.0
+    emulate_kernel: str | None = None
+    emulate_machine: str | None = None
+    emulate_dtb: str | None = None
+    emulate_nic: str | None = None
+    emulate_append: str | None = None
+    emulate_image: str | None = None
+    emulate_initrd: str | None = None
 
 
 @dataclass
@@ -135,6 +145,9 @@ def scan(path: str, options: ScanOptions | None = None) -> ScanResult:
     if options.emulate and ctx.inventory is not None and ctx.extraction is not None:
         _run_emulation(result, ctx, options)
 
+    if options.emulate_system and ctx.inventory is not None and ctx.extraction is not None:
+        _run_system_emulation(result, ctx, options)
+
     result.findings.sort(key=lambda f: (-f.severity.rank, not f.metadata.get("kev"), -(f.metadata.get("cvss_score") or 0), f.analyzer, f.title))
     result.finished = _now()
     return result
@@ -172,6 +185,39 @@ def _run_emulation(result: ScanResult, ctx: ScanContext, options: ScanOptions) -
         result.errors.append({"stage": "emulation", "error": f"{type(exc).__name__}: {exc}", "traceback": traceback.format_exc()})
     finally:
         result.timings["emulation"] = round(time.perf_counter() - t0, 3)
+
+
+def _run_system_emulation(result: ScanResult, ctx: ScanContext, options: ScanOptions) -> None:
+    """Run the opt-in full-system (Phase B) emulation stage."""
+    t0 = time.perf_counter()
+    try:
+        from firefly.emulation.system import SystemOptions, run_system
+
+        assert ctx.extraction is not None and ctx.inventory is not None
+        sys_opts = SystemOptions(
+            timeout_s=options.emulate_system_timeout,
+            require_sandbox=options.emulate_sandbox,
+            kernel=options.emulate_kernel,
+            machine=options.emulate_machine,
+            dtb=options.emulate_dtb,
+            nic=options.emulate_nic,
+            append=options.emulate_append,
+            image=options.emulate_image,
+            initrd=options.emulate_initrd,
+            workdir=ctx.workdir,
+        )
+        res = run_system(ctx.extraction, ctx.inventory, sys_opts)
+        result.findings.extend(res.to_findings())
+        result.artifacts["system_emulation"] = res.to_artifact()
+        if not res.available and res.reason:
+            result.warnings.append(f"full-system emulation skipped: {res.reason}")
+        elif not res.booted:
+            result.warnings.append(f"full-system emulation: {res.boot_reason}")
+    except Exception as exc:  # emulation failure must not lose the scan
+        log.debug("system emulation stage failed", exc_info=True)
+        result.errors.append({"stage": "system_emulation", "error": f"{type(exc).__name__}: {exc}", "traceback": traceback.format_exc()})
+    finally:
+        result.timings["system_emulation"] = round(time.perf_counter() - t0, 3)
 
 
 def _now() -> str:
