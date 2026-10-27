@@ -9,25 +9,25 @@ evidence shows up alongside the static findings.
 
 from __future__ import annotations
 
-import signal
 from dataclasses import dataclass, field
 from typing import Any
 
 from firefly.models import Finding, Severity
 
 # Signals that mean the binary crashed on a memory-safety or illegal-instruction
-# fault rather than being stopped by us. SIGKILL is excluded: that is normally
-# our timeout or an out-of-memory kill, not a bug in the binary.
-# Built with getattr because Windows' signal module lacks SIGBUS/SIGSYS; the
-# numeric fallbacks are the standard Linux values, which is what matters since
-# emulation only ever runs on Linux.
+# fault rather than being stopped by us. SIGKILL (9) is excluded: that is
+# normally our timeout or an out-of-memory kill, not a bug in the binary.
+# These are fixed Linux signal numbers on purpose: they describe signals a
+# Linux qemu process dies from, so they must not vary with the host Python runs
+# on (Windows numbers SIGABRT as 22, not 6). Hardcoding them also avoids
+# referencing SIGBUS/SIGSYS, which the Windows signal module does not define.
 CRASH_SIGNALS = {
-    getattr(signal, "SIGSEGV", 11): "SIGSEGV",
-    getattr(signal, "SIGABRT", 6): "SIGABRT",
-    getattr(signal, "SIGBUS", 7): "SIGBUS",
-    getattr(signal, "SIGILL", 4): "SIGILL",
-    getattr(signal, "SIGFPE", 8): "SIGFPE",
-    getattr(signal, "SIGSYS", 31): "SIGSYS",
+    11: "SIGSEGV",
+    6: "SIGABRT",
+    7: "SIGBUS",
+    4: "SIGILL",
+    8: "SIGFPE",
+    31: "SIGSYS",
 }
 
 

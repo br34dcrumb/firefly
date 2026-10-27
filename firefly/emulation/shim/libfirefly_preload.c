@@ -27,13 +27,28 @@
 #include <string.h>
 #include <unistd.h>
 
+/*
+ * Log one event. This MUST reach the real libc fopen via RTLD_NEXT, not the
+ * fopen we interpose below: calling our own fopen here would recurse
+ * (ff_log -> fopen -> ff_log -> ...) and blow the stack. A reentrancy guard
+ * additionally keeps any interposed call made while logging from re-entering.
+ */
+static __thread int ff_in_log = 0;
+
 static void ff_log(const char *kind, const char *value) {
+    if (ff_in_log) return;
     const char *path = getenv("FIREFLY_SHIM_LOG");
     if (!path || !value) return;
-    FILE *fh = fopen(path, "a");
-    if (!fh) return;
-    fprintf(fh, "%s\t%s\n", kind, value);
-    fclose(fh);
+    ff_in_log = 1;
+    FILE *(*real_fopen)(const char *, const char *) = dlsym(RTLD_NEXT, "fopen");
+    if (real_fopen) {
+        FILE *fh = real_fopen(path, "a");
+        if (fh) {
+            fprintf(fh, "%s\t%s\n", kind, value);
+            fclose(fh);
+        }
+    }
+    ff_in_log = 0;
 }
 
 int system(const char *command) {

@@ -12,7 +12,7 @@ import os
 import subprocess
 import time
 
-from firefly.emulation.result import BinaryRun
+from firefly.emulation.result import CRASH_SIGNALS, BinaryRun
 from firefly.emulation.sandbox import SandboxPolicy, build_command
 from firefly.models import ElfInfo
 
@@ -87,14 +87,31 @@ def run_binary(
     run.duration_s = time.perf_counter() - start
     run.stdout_tail = _tail(proc.stdout)
     run.stderr_tail = _tail(proc.stderr)
-    # POSIX: a negative returncode is -signal.
-    if proc.returncode is not None and proc.returncode < 0:
-        run.term_signal = -proc.returncode
-    else:
-        run.returncode = proc.returncode
+    run.term_signal, run.returncode = _classify_exit(proc.returncode)
     if use_shim:
         _read_shim_log(log_path, run)  # type: ignore[arg-type]
     return run
+
+
+def _classify_exit(returncode: int | None) -> tuple[int | None, int | None]:
+    """Split a subprocess return code into ``(term_signal, returncode)``.
+
+    Two cases both mean "killed by signal N":
+      * ``returncode < 0`` — the direct child (qemu, no sandbox) was killed by
+        signal ``-returncode``;
+      * ``returncode >= 128`` where ``returncode - 128`` is a crash signal — an
+        intermediate parent (bubblewrap) reaped the crashed qemu and re-exited
+        with the shell's ``128 + signal`` convention, masking the signal. We
+        only remap codes whose ``- 128`` is a known crash signal, so an ordinary
+        high exit status (e.g. 129) is still reported as a return code.
+    """
+    if returncode is None:
+        return None, None
+    if returncode < 0:
+        return -returncode, None
+    if returncode >= 128 and (returncode - 128) in CRASH_SIGNALS:
+        return returncode - 128, None
+    return None, returncode
 
 
 def _read_shim_log(log_path: str, run: BinaryRun) -> None:

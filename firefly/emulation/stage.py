@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass
 
@@ -30,6 +31,12 @@ PRIORITY_NAMES = (
     "cgibin", "cgi-bin",
 )
 
+# Shared objects are ET_DYN too, so is_executable_code() can't tell them from
+# PIE programs. Firmware ships hundreds of libraries that are not meant to be
+# executed on their own (running one just errors), so exclude anything whose
+# name looks like a shared object: ``libc.so.6``, ``ld-linux.so.3``, ``foo.so``.
+_SHARED_OBJECT = re.compile(r"\.so(\.\d+)*$")
+
 
 @dataclass
 class EmulationOptions:
@@ -47,9 +54,13 @@ def _priority(rec: FileRecord) -> int:
     return 0 if any(name in base for name in PRIORITY_NAMES) else 1
 
 
+def _is_program(rec: FileRecord) -> bool:
+    return bool(rec.is_executable_code and rec.elf) and not _SHARED_OBJECT.search(os.path.basename(rec.path))
+
+
 def select_binaries(inv: Inventory, limit: int) -> list[FileRecord]:
-    """Executable ELFs, priority services first, capped at ``limit``."""
-    elves = [r for r in inv.of_kind(FileKind.ELF) if r.is_executable_code and r.elf]
+    """Executable ELF programs (not shared libraries), priority services first."""
+    elves = [r for r in inv.of_kind(FileKind.ELF) if _is_program(r)]
     elves.sort(key=lambda r: (_priority(r), r.path))
     return elves[:limit]
 
@@ -59,7 +70,9 @@ def run_emulation(rootfs: str, inv: Inventory, options: EmulationOptions) -> Emu
     if not sys.platform.startswith("linux"):
         return EmulationResult(available=False, reason="emulation requires Linux (qemu-user)")
 
-    policy = SandboxPolicy(require_isolation=options.require_sandbox)
+    # --no-emulate-sandbox (require_sandbox=False) both allows running without a
+    # sandbox and forces the rlimit-only tier instead of bubblewrap.
+    policy = SandboxPolicy(require_isolation=options.require_sandbox, use_bwrap=options.require_sandbox)
     tier, refusal = detect_tier(policy)
     if refusal:
         return EmulationResult(available=False, reason=refusal)

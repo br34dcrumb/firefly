@@ -28,17 +28,16 @@ try:
 except ImportError:  # pragma: no cover - Windows
     resource = None  # type: ignore[assignment]
 
-DEFAULT_MEM_BYTES = 2 * 1024**3  # 2 GiB address space
 DEFAULT_CPU_SECONDS = 30  # CPU time, independent of the wall-clock timeout
 DEFAULT_FSIZE_BYTES = 64 * 1024**2  # largest file the binary may create
 
 
 @dataclass
 class SandboxPolicy:
-    mem_bytes: int = DEFAULT_MEM_BYTES
     cpu_seconds: int = DEFAULT_CPU_SECONDS
     fsize_bytes: int = DEFAULT_FSIZE_BYTES
-    require_isolation: bool = True  # refuse rlimit-only unless explicitly allowed
+    require_isolation: bool = True  # refuse to run at all when no sandbox is available
+    use_bwrap: bool = True  # False (via --no-emulate-sandbox) forces rlimit-only
 
 
 def bwrap_available() -> bool:
@@ -51,7 +50,7 @@ def detect_tier(policy: SandboxPolicy) -> tuple[str, str | None]:
     Returns ``(tier, refusal_reason)``. When ``refusal_reason`` is set the
     caller must not execute anything.
     """
-    if bwrap_available():
+    if policy.use_bwrap and bwrap_available():
         return "bwrap", None
     if policy.require_isolation:
         return "none", (
@@ -68,7 +67,12 @@ def _rlimits(policy: SandboxPolicy):
         return None
 
     def apply() -> None:
-        resource.setrlimit(resource.RLIMIT_AS, (policy.mem_bytes, policy.mem_bytes))
+        # NB: no RLIMIT_AS. qemu-user reserves a huge contiguous virtual address
+        # space for the guest (~4 GiB for a 32-bit guest); an address-space cap
+        # makes it fail to start ("Unable to reserve ... virtual address space")
+        # rather than bound anything useful. Runaway memory in this degraded
+        # tier is bounded by the wall-clock timeout; bubblewrap is the real
+        # sandbox. We still cap CPU time, file size, process count and cores.
         resource.setrlimit(resource.RLIMIT_CPU, (policy.cpu_seconds, policy.cpu_seconds))
         resource.setrlimit(resource.RLIMIT_FSIZE, (policy.fsize_bytes, policy.fsize_bytes))
         resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))

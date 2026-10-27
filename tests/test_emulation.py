@@ -11,12 +11,13 @@ from __future__ import annotations
 import firefly.emulation.stage as stage
 from firefly.emulation import qemu, sandbox
 from firefly.emulation.result import BinaryRun, EmulationResult
+from firefly.emulation.runner import _classify_exit
 from firefly.emulation.sandbox import SandboxPolicy
 from firefly.emulation.stage import EmulationOptions, run_emulation, select_binaries
 from firefly.inventory import Inventory
 from firefly.models import ElfInfo, FileKind, FileRecord, Severity
 
-from elfbuild import ET_EXEC, build_elf
+from elfbuild import ET_DYN, ET_EXEC, build_elf
 
 # --------------------------------------------------------------------------- qemu mapping
 
@@ -72,6 +73,13 @@ def test_detect_tier_prefers_bwrap(monkeypatch):
     assert tier == "bwrap" and refusal is None
 
 
+def test_detect_tier_use_bwrap_false_forces_rlimit(monkeypatch):
+    # --no-emulate-sandbox: skip bwrap even when it is available.
+    monkeypatch.setattr(sandbox, "bwrap_available", lambda: True)
+    tier, refusal = sandbox.detect_tier(SandboxPolicy(require_isolation=False, use_bwrap=False))
+    assert tier == "rlimit-only" and refusal is None
+
+
 def test_build_command_bwrap_isolates_and_binds():
     argv, preexec = sandbox.build_command(
         "bwrap", SandboxPolicy(), "/root", ["qemu-arm", "/root/bin/sh"],
@@ -106,6 +114,42 @@ def test_select_binaries_prioritises_services(tmp_path):
 def test_select_binaries_respects_limit(tmp_path):
     inv = _elf_tree(tmp_path, ["bin/a", "bin/b", "bin/c"])
     assert len(select_binaries(inv, limit=2)) == 2
+
+
+def test_select_binaries_excludes_shared_objects(tmp_path):
+    # Shared objects are ET_DYN like PIE programs, but must not be emulated.
+    root = tmp_path / "root"
+    for rel, etype in [
+        ("bin/ls", ET_EXEC),
+        ("usr/sbin/httpd", ET_DYN),      # PIE program: keep
+        ("lib/libc.so.6", ET_DYN),       # library: drop
+        ("lib/ld-linux.so.3", ET_DYN),   # loader: drop
+        ("usr/lib/foo.so", ET_DYN),      # library: drop
+    ]:
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(build_elf(etype=etype))
+    selected = {r.path for r in select_binaries(Inventory.build(str(root)), limit=10)}
+    assert selected == {"bin/ls", "usr/sbin/httpd"}
+
+
+# --------------------------------------------------------------------------- exit classification
+
+
+def test_classify_exit_direct_signal():
+    assert _classify_exit(-11) == (11, None)   # qemu killed by SIGSEGV (no sandbox)
+
+
+def test_classify_exit_bwrap_masks_signal_as_128_plus():
+    assert _classify_exit(139) == (11, None)   # 128+SIGSEGV from bubblewrap
+    assert _classify_exit(134) == (6, None)    # 128+SIGABRT
+
+
+def test_classify_exit_ordinary_codes_are_not_crashes():
+    assert _classify_exit(0) == (None, 0)
+    assert _classify_exit(1) == (None, 1)
+    assert _classify_exit(129) == (None, 129)  # 128+SIGHUP is not a crash signal
+    assert _classify_exit(None) == (None, None)
 
 
 # --------------------------------------------------------------------------- result -> findings
