@@ -28,6 +28,7 @@ class ScanContext:
     extraction: ExtractionResult | None = None
     inventory: Inventory | None = None
     db_path: str | None = None
+    fpdb_path: str | None = None
     # Components found by analyzers that already ran (analyzers run in order).
     components: list[Component] = field(default_factory=list)
 
@@ -57,14 +58,17 @@ def builtin_analyzers() -> list[type[Analyzer]]:
     from firefly.analyzers.cves import CveAnalyzer
     from firefly.analyzers.dangerfns import DangerousFunctionsAnalyzer
     from firefly.analyzers.entropy import EntropyAnalyzer
+    from firefly.analyzers.fingerprint import FingerprintAnalyzer
     from firefly.analyzers.hardening import HardeningAnalyzer
     from firefly.analyzers.services import ServicesAnalyzer
     from firefly.analyzers.versions import VersionAnalyzer
 
-    # Order matters: cves consumes the components versions produces.
+    # Order matters: cves consumes the components that versions and fingerprint
+    # produce, so both run before it.
     return [
         EntropyAnalyzer,
         VersionAnalyzer,
+        FingerprintAnalyzer,
         CveAnalyzer,
         HardeningAnalyzer,
         DangerousFunctionsAnalyzer,

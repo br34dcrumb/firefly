@@ -31,6 +31,7 @@ class ScanOptions:
     only: list[str] | None = None
     skip: list[str] = field(default_factory=list)
     db_path: str | None = None
+    fpdb_path: str | None = None
     run_static: bool = True  # run the static analyzers (off for `firefly emulate`)
     emulate: bool = False  # opt-in dynamic emulation stage (executes binaries)
     emulate_timeout: float = 20.0
@@ -99,7 +100,7 @@ def scan(path: str, options: ScanOptions | None = None) -> ScanResult:
     os.makedirs(workdir, exist_ok=True)
 
     result = ScanResult(path, digest, size, workdir, started=_now())
-    ctx = ScanContext(firmware_path=path, workdir=workdir, jobs=max(1, options.jobs), db_path=options.db_path)
+    ctx = ScanContext(firmware_path=path, workdir=workdir, jobs=max(1, options.jobs), db_path=options.db_path, fpdb_path=options.fpdb_path)
 
     t0 = time.perf_counter()
     try:

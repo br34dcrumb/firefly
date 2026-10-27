@@ -26,6 +26,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--only", action="append", metavar="ANALYZER", help="run only this analyzer (repeatable)")
     scan.add_argument("--skip", action="append", default=[], metavar="ANALYZER", help="skip this analyzer (repeatable)")
     scan.add_argument("--db", metavar="PATH", help="vulnerability database (default: $FIREFLY_DB or ~/.cache/firefly)")
+    scan.add_argument("--fpdb", metavar="PATH", help="function-fingerprint database (default: $FIREFLY_FPDB or ~/.cache/firefly)")
     scan.add_argument("--no-sbom", action="store_true", help="don't write a CycloneDX SBOM")
     scan.add_argument("--no-html", action="store_true", help="don't write the HTML report")
     scan.add_argument("--sarif", action="store_true", help="also write a SARIF file for CI (e.g. GitHub code scanning)")
@@ -65,6 +66,14 @@ def build_parser() -> argparse.ArgumentParser:
     db_sub.add_parser("info", help="show database status")
     for p in (upd, imp, db_sub.choices["info"]):
         p.add_argument("--db", metavar="PATH", help="database path")
+
+    fpdb = sub.add_parser("fpdb", help="manage the function-fingerprint database for binary SCA")
+    fpdb_sub = fpdb.add_subparsers(dest="fpdb_command")
+    fpbuild = fpdb_sub.add_parser("build", help="build signatures from reference binaries described by a JSON manifest")
+    fpbuild.add_argument("manifest", help="JSON manifest: [{path, product, version, vendor?, arch?}, ...]")
+    fpdb_sub.add_parser("info", help="show fingerprint database status")
+    for p in (fpbuild, fpdb_sub.choices["info"]):
+        p.add_argument("--fpdb", metavar="PATH", help="database path")
 
     disc = sub.add_parser("disclose", help="prepare coordinated-disclosure advisory drafts from a scan report (never sends)")
     disc.add_argument("report", help="path to a firefly.json scan report")
@@ -117,6 +126,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "db":
         return _db_command(args)
 
+    if args.command == "fpdb":
+        return _fpdb_command(args)
+
     if args.command == "disclose":
         return _disclose_command(args)
 
@@ -147,6 +159,7 @@ def _scan_command(args: argparse.Namespace) -> int:
         only=args.only,
         skip=args.skip,
         db_path=args.db,
+        fpdb_path=args.fpdb,
         emulate=args.emulate,
         emulate_timeout=args.emulate_timeout,
         emulate_max=args.emulate_max,
@@ -279,6 +292,34 @@ def _disclose_command(args: argparse.Namespace) -> int:
     print(f"  index:   {os.path.join(out_dir, 'README.md')}")
     print(f"  tracker: {tracker_path}")
     print("These are drafts. Review each one and confirm the vendor contact before sending; Firefly sends nothing.")
+    return 0
+
+
+def _fpdb_command(args: argparse.Namespace) -> int:
+    from firefly import fpdb
+
+    path = args.fpdb or fpdb.default_fpdb_path()
+    if args.fpdb_command == "build":
+        if not os.path.isfile(args.manifest):
+            print(f"firefly: manifest not found: {args.manifest}", file=sys.stderr)
+            return 2
+        try:
+            info = fpdb.build_from_manifest(path, args.manifest)
+        except (OSError, KeyError, ValueError) as exc:
+            print(f"firefly: fingerprint build failed: {exc}", file=sys.stderr)
+            return 1
+    elif args.fpdb_command == "info":
+        db = fpdb.FpDB.open_existing(path)
+        if db is None:
+            print(f"no fingerprint database at {path}; run `firefly fpdb build <manifest>`")
+            return 1
+        with db:
+            info = db.info()
+    else:
+        build_parser().parse_args(["fpdb", "--help"])
+        return 2
+    for key, value in info.items():
+        print(f"{key:<16} {value}")
     return 0
 
 
