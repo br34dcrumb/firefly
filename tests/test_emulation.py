@@ -80,7 +80,9 @@ def test_detect_tier_use_bwrap_false_forces_rlimit(monkeypatch):
     assert tier == "rlimit-only" and refusal is None
 
 
-def test_build_command_bwrap_isolates_and_binds():
+def test_build_command_bwrap_isolates_and_binds(monkeypatch):
+    # Pretend the host has system-code dirs but also a home dir.
+    monkeypatch.setattr(sandbox, "host_ro_binds", lambda: ["/usr", "/lib"])
     argv, preexec = sandbox.build_command(
         "bwrap", SandboxPolicy(), "/root", ["qemu-arm", "/root/bin/sh"],
         extra_ro=["/usr/bin/qemu-arm"], rw_binds=["/logs"],
@@ -90,6 +92,19 @@ def test_build_command_bwrap_isolates_and_binds():
     assert "--bind" in argv and "/logs" in argv
     assert argv[-2:] == ["qemu-arm", "/root/bin/sh"]
     assert preexec is None  # namespace does the confining
+    # S1: system code is bound, the whole host root is not, home stays hidden.
+    assert "/usr" in argv and "/lib" in argv
+    idx = argv.index("--ro-bind")
+    assert not (argv[idx + 1] == "/" and argv[idx + 2] == "/")
+
+
+def test_host_ro_binds_excludes_home_and_etc(monkeypatch):
+    present = {"/usr", "/lib", "/bin", "/home", "/root", "/etc", "/etc/ld.so.cache"}
+    monkeypatch.setattr(sandbox.os.path, "exists", lambda p: p in present)
+    binds = sandbox.host_ro_binds()
+    assert "/usr" in binds and "/lib" in binds and "/etc/ld.so.cache" in binds
+    assert "/home" not in binds and "/root" not in binds
+    assert "/etc" not in binds  # only the loader cache, not all of /etc
 
 
 # --------------------------------------------------------------------------- candidate selection
@@ -155,13 +170,16 @@ def test_classify_exit_ordinary_codes_are_not_crashes():
 # --------------------------------------------------------------------------- result -> findings
 
 
-def test_crash_run_becomes_high_finding():
+def test_crash_run_becomes_medium_low_confidence_finding():
     run = BinaryRun(path="usr/sbin/httpd", arch="arm", qemu="qemu-arm", term_signal=11, stderr_tail="boom")
     assert run.crashed and run.signal_name == "SIGSEGV"
     res = EmulationResult(available=True, runs=[run])
     findings = res.to_findings()
     assert len(findings) == 1
-    assert findings[0].severity is Severity.HIGH
+    # Bare-launch crashes are plausible missing-environment faults, not proven
+    # bugs: reported at medium severity / low confidence.
+    assert findings[0].severity is Severity.MEDIUM
+    assert findings[0].confidence == "low"
     assert findings[0].analyzer == "emulation"
     assert findings[0].path == "usr/sbin/httpd"
 
@@ -186,34 +204,42 @@ def test_runtime_command_becomes_finding():
 def test_run_emulation_requires_linux(tmp_path, monkeypatch):
     monkeypatch.setattr(stage.sys, "platform", "win32")
     inv = _elf_tree(tmp_path, ["bin/ls"])
-    res = run_emulation(str(tmp_path), inv, EmulationOptions(enabled=True))
+    res = run_emulation(str(tmp_path), inv, EmulationOptions())
     assert res.available is False
     assert "Linux" in res.reason
 
 
-def test_run_emulation_runs_candidates(tmp_path, monkeypatch):
-    inv = _elf_tree(tmp_path, ["usr/sbin/httpd", "bin/ls"])
-
+def _fake_emulation(monkeypatch, tier="rlimit-only"):
     monkeypatch.setattr(stage.sys, "platform", "linux")
-    monkeypatch.setattr(stage, "detect_tier", lambda policy: ("rlimit-only", None))
+    monkeypatch.setattr(stage, "detect_tier", lambda policy: (tier, None))
     monkeypatch.setattr(stage.qemu, "resolve", lambda elf: ("qemu-arm", "/usr/bin/qemu-arm"))
 
-    calls: list[str] = []
-
     def fake_run_binary(rootfs, rel_path, elf, qemu_path, **kw):
-        calls.append(rel_path)
         sig = 11 if "httpd" in rel_path else None
         return BinaryRun(path=rel_path, arch=elf.machine, qemu="qemu-arm", term_signal=sig, returncode=None if sig else 0)
 
     monkeypatch.setattr(stage, "run_binary", fake_run_binary)
 
-    res = run_emulation(str(inv.root), inv, EmulationOptions(enabled=True, require_sandbox=False))
+
+def test_run_emulation_runs_candidates(tmp_path, monkeypatch):
+    inv = _elf_tree(tmp_path, ["usr/sbin/httpd", "bin/ls"])
+    _fake_emulation(monkeypatch)
+
+    res = run_emulation(str(inv.root), inv, EmulationOptions(require_sandbox=False))
     assert res.available and res.sandbox == "rlimit-only"
     assert res.candidates == 2 and len(res.runs) == 2
-    assert calls[0] == "usr/sbin/httpd"  # priority ordering preserved
+    assert res.runs[0].path == "usr/sbin/httpd"  # priority ordering preserved
     assert res.qemu_found == {"arm": "/usr/bin/qemu-arm"}
     findings = res.to_findings()
-    assert any(f.severity is Severity.HIGH for f in findings)
+    assert any(f.severity is Severity.MEDIUM for f in findings)
+
+
+def test_run_emulation_parallel_preserves_order(tmp_path, monkeypatch):
+    inv = _elf_tree(tmp_path, ["usr/sbin/httpd", "bin/a", "bin/b", "bin/c"])
+    _fake_emulation(monkeypatch)
+    res = run_emulation(str(inv.root), inv, EmulationOptions(require_sandbox=False, jobs=4))
+    # map() keeps results in candidate order regardless of completion order.
+    assert [r.path for r in res.runs] == ["usr/sbin/httpd", "bin/a", "bin/b", "bin/c"]
 
 
 def test_run_emulation_reports_missing_qemu(tmp_path, monkeypatch):
@@ -222,6 +248,6 @@ def test_run_emulation_reports_missing_qemu(tmp_path, monkeypatch):
     monkeypatch.setattr(stage, "detect_tier", lambda policy: ("rlimit-only", None))
     monkeypatch.setattr(stage.qemu, "resolve", lambda elf: ("qemu-arm", None))  # program known, not installed
 
-    res = run_emulation(str(inv.root), inv, EmulationOptions(enabled=True, require_sandbox=False))
+    res = run_emulation(str(inv.root), inv, EmulationOptions(require_sandbox=False))
     assert res.available and res.skipped == 1 and not res.runs
     assert "qemu-user" in res.reason

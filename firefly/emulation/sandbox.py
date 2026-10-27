@@ -3,12 +3,14 @@
 qemu-user is not a security boundary, so the real confinement comes from here.
 Two tiers, strongest first:
 
-* **bwrap** (bubblewrap): a new mount/pid/ipc/uts/**network** namespace, the
-  host filesystem bound read-only, writable tmpfs for the working dirs, and the
-  process dies with its parent. This blocks network egress and host writes.
+* **bwrap** (bubblewrap): a new mount/pid/ipc/uts/**network** namespace, only
+  the system code directories bound read-only (never home directories or the
+  secrets under ``/etc``), writable tmpfs for the working dirs, and the process
+  dies with its parent. This blocks network egress, host writes, and reading of
+  the operator's files.
 * **rlimit-only**: no namespaces, just POSIX resource limits via a ``preexec``
-  hook (CPU time, address space, file size, no new processes). This is a
-  fallback with no network or filesystem isolation.
+  hook (CPU time, file size, process count, no core dumps). This is a fallback
+  with no network or filesystem isolation.
 
 Firefly refuses to run emulation without bwrap unless the operator explicitly
 opts out (``--no-emulate-sandbox``), because that means executing untrusted
@@ -30,6 +32,22 @@ except ImportError:  # pragma: no cover - Windows
 
 DEFAULT_CPU_SECONDS = 30  # CPU time, independent of the wall-clock timeout
 DEFAULT_FSIZE_BYTES = 64 * 1024**2  # largest file the binary may create
+
+# Host directories bound read-only into the sandbox so a dynamically linked
+# qemu-user (and the guest, via -L) can resolve its code. Deliberately omits
+# /home, /root, /mnt, /media, /opt, /srv and the bulk of /etc, so an emulated
+# binary cannot read the operator's files or secrets like /etc/shadow. Only the
+# paths that actually exist on the host are bound.
+_HOST_CODE_DIRS = (
+    "/usr", "/lib", "/lib64", "/lib32", "/libx32", "/bin", "/sbin",
+    # just enough of /etc for the dynamic loader, not the whole directory
+    "/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d", "/etc/alternatives",
+)
+
+
+def host_ro_binds() -> list[str]:
+    """The subset of :data:`_HOST_CODE_DIRS` present on this host."""
+    return [p for p in _HOST_CODE_DIRS if os.path.exists(p)]
 
 
 @dataclass
@@ -84,26 +102,29 @@ def _rlimits(policy: SandboxPolicy):
 def _bwrap_prefix(rootfs: str, extra_ro: list[str], rw_binds: list[str]) -> list[str]:
     """Build the ``bwrap ... --`` prefix that precedes the qemu command.
 
-    The host filesystem is mounted read-only so qemu and its libraries resolve,
-    the scan root is also read-only, and ``/tmp``, ``/var`` and ``/run`` are
-    fresh tmpfs so a firmware process has somewhere to write without touching
-    the host. ``--unshare-all`` includes the network namespace, so there is no
-    egress. ``rw_binds`` are the only writable host paths (used for the shim's
-    observation log), bound read-write so we can read events back afterwards.
+    Only the host's system-code directories are mounted read-only (so qemu and
+    its libraries resolve) — never home directories or the secrets in ``/etc``.
+    The scan root, the qemu binary and the shim are bound read-only explicitly
+    (they may live outside those dirs, e.g. under the output directory), and
+    ``/tmp``, ``/run`` and ``/var/tmp`` are fresh tmpfs so a firmware process
+    has somewhere to write without touching the host. ``--unshare-all`` includes
+    the network namespace, so there is no egress. ``rw_binds`` are the only
+    writable host paths (the shim's observation log), bound read-write so we can
+    read events back afterwards.
     """
     cmd = [
         "bwrap",
         "--unshare-all",
         "--die-with-parent",
-        "--ro-bind", "/", "/",
         "--dev", "/dev",
         "--proc", "/proc",
         "--tmpfs", "/tmp",
         "--tmpfs", "/run",
         "--tmpfs", "/var/tmp",
-        "--ro-bind", rootfs, rootfs,
-        "--chdir", rootfs,
     ]
+    for path in host_ro_binds():
+        cmd += ["--ro-bind", path, path]
+    cmd += ["--ro-bind", rootfs, rootfs, "--chdir", rootfs]
     for path in extra_ro:
         cmd += ["--ro-bind", path, path]
     for path in rw_binds:

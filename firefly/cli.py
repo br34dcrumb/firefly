@@ -82,6 +82,7 @@ def _add_emulation_args(p: argparse.ArgumentParser) -> None:
     """
     p.add_argument("--emulate-timeout", type=float, default=20.0, metavar="SEC", help="wall-clock timeout per binary (default: %(default)s)")
     p.add_argument("--emulate-max", type=int, default=64, metavar="N", help="max binaries to emulate (default: %(default)s)")
+    p.add_argument("--emulate-arg", action="append", default=[], metavar="ARG", help="argument to pass to each emulated binary (repeatable)")
     p.add_argument("--no-emulate-sandbox", action="store_true", help="run without bubblewrap isolation (resource limits only; unsafe)")
     p.add_argument("--emulate-shim", action="store_true", help="cross-compile and inject the runtime interception shim if a toolchain is available")
 
@@ -135,6 +136,7 @@ def _scan_command(args: argparse.Namespace) -> int:
         emulate_max=args.emulate_max,
         emulate_sandbox=not args.no_emulate_sandbox,
         emulate_shim=args.emulate_shim,
+        emulate_args=tuple(args.emulate_arg),
     )
     result = scan(args.input, options)
     report_path = write_json(result)
@@ -176,6 +178,7 @@ def _emulate_command(args: argparse.Namespace) -> int:
         emulate_max=args.emulate_max,
         emulate_sandbox=not args.no_emulate_sandbox,
         emulate_shim=args.emulate_shim,
+        emulate_args=tuple(args.emulate_arg),
     )
     result = scan(args.input, options)
     report_path = write_json(result)

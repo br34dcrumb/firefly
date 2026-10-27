@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from firefly.emulation import qemu, shimbuild
@@ -40,9 +41,9 @@ _SHARED_OBJECT = re.compile(r"\.so(\.\d+)*$")
 
 @dataclass
 class EmulationOptions:
-    enabled: bool = False
     timeout_s: float = 20.0
     max_binaries: int = 64
+    jobs: int = 1  # binaries emulated concurrently
     require_sandbox: bool = True  # False == --no-emulate-sandbox
     args: tuple[str, ...] = ()
     build_shim: bool = False  # cross-compile the interception shim if a toolchain exists
@@ -80,17 +81,10 @@ def run_emulation(rootfs: str, inv: Inventory, options: EmulationOptions) -> Emu
     candidates = select_binaries(inv, options.max_binaries)
     result = EmulationResult(available=True, sandbox=tier, candidates=len(candidates))
 
-    shims: dict[tuple[str, str], str | None] = {}  # (machine, endian) -> shim path or None
-
-    def shim_for(machine: str, endian: str) -> str | None:
-        if not options.build_shim or options.workdir is None:
-            return None
-        key = (machine, endian)
-        if key not in shims:
-            shims[key] = shimbuild.build_for(machine, endian, os.path.join(options.workdir, "shims"))
-        return shims[key]
-
-    for i, rec in enumerate(candidates):
+    # Resolve qemu for each candidate first (serial, cheap), so skipped counts
+    # and qemu_found are deterministic before any binary runs.
+    tasks: list[tuple[FileRecord, str]] = []  # (record, qemu path)
+    for rec in candidates:
         assert rec.elf is not None
         program, qemu_path = qemu.resolve(rec.elf)
         if program is None:
@@ -102,25 +96,40 @@ def run_emulation(rootfs: str, inv: Inventory, options: EmulationOptions) -> Emu
             log.debug("qemu program %s not installed for %s", program, rec.path)
             continue
         result.qemu_found[rec.elf.machine] = qemu_path
-        shim_path = shim_for(rec.elf.machine, rec.elf.endian)
+        tasks.append((rec, qemu_path))
+
+    # Cross-compile the shim once per architecture up front, so parallel workers
+    # never race on compiling it.
+    shims: dict[tuple[str, str], str | None] = {}
+    if options.build_shim and options.workdir:
+        for rec, _ in tasks:
+            key = (rec.elf.machine, rec.elf.endian)  # type: ignore[union-attr]
+            if key not in shims:
+                shims[key] = shimbuild.build_for(key[0], key[1], os.path.join(options.workdir, "shims"))
+
+    def run_one(indexed: tuple[int, tuple[FileRecord, str]]):
+        i, (rec, qemu_path) = indexed
+        assert rec.elf is not None
+        shim_path = shims.get((rec.elf.machine, rec.elf.endian))
         log_path = (
             os.path.join(options.workdir, "shim-logs", f"{i:04d}.log")
             if shim_path and options.workdir
             else None
         )
-        run = run_binary(
-            rootfs,
-            rec.path,
-            rec.elf,
-            qemu_path,
-            tier=tier,
-            policy=policy,
-            args=list(options.args),
-            timeout_s=options.timeout_s,
-            shim_path=shim_path,
-            log_path=log_path,
+        return run_binary(
+            rootfs, rec.path, rec.elf, qemu_path,
+            tier=tier, policy=policy, args=list(options.args),
+            timeout_s=options.timeout_s, shim_path=shim_path, log_path=log_path,
         )
-        result.runs.append(run)
+
+    # Emulation is I/O-bound (each run waits on a subprocess), so threads give
+    # real concurrency here. map() keeps the results in candidate order.
+    workers = max(1, min(options.jobs, len(tasks))) if tasks else 1
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            result.runs = list(pool.map(run_one, enumerate(tasks)))
+    else:
+        result.runs = [run_one(item) for item in enumerate(tasks)]
 
     if candidates and not result.qemu_found:
         archs = sorted({r.elf.machine for r in candidates if r.elf})

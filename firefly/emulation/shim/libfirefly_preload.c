@@ -21,11 +21,17 @@
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+/* Cap the observation log so a binary that opens files in a loop cannot grow
+ * it without bound and fill the host disk (the log lives on a real host path). */
+#define FF_LOG_MAX (256 * 1024)
+static long ff_written = 0;
 
 /*
  * Log one event. This MUST reach the real libc fopen via RTLD_NEXT, not the
@@ -36,7 +42,7 @@
 static __thread int ff_in_log = 0;
 
 static void ff_log(const char *kind, const char *value) {
-    if (ff_in_log) return;
+    if (ff_in_log || ff_written >= FF_LOG_MAX) return;
     const char *path = getenv("FIREFLY_SHIM_LOG");
     if (!path || !value) return;
     ff_in_log = 1;
@@ -44,7 +50,8 @@ static void ff_log(const char *kind, const char *value) {
     if (real_fopen) {
         FILE *fh = real_fopen(path, "a");
         if (fh) {
-            fprintf(fh, "%s\t%s\n", kind, value);
+            int n = fprintf(fh, "%s\t%s\n", kind, value);
+            if (n > 0) ff_written += n;
             fclose(fh);
         }
     }
@@ -70,10 +77,15 @@ int execve(const char *path, char *const argv[], char *const envp[]) {
 }
 
 int open(const char *path, int flags, ...) {
-    va_list ap;
-    va_start(ap, flags);
-    int mode = va_arg(ap, int);
-    va_end(ap);
+    /* The mode argument is only present when creating a file; reading it
+     * otherwise is undefined. */
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, int);
+        va_end(ap);
+    }
     ff_log("OPEN", path ? path : "(null)");
     int (*real)(const char *, int, ...) = dlsym(RTLD_NEXT, "open");
     return real ? real(path, flags, mode) : -1;

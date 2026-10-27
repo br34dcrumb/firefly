@@ -9,6 +9,7 @@ sandbox's resource limits, and report how it exited.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import time
 
@@ -53,7 +54,8 @@ def run_binary(
         extra_ro.append(shim_path)  # type: ignore[arg-type]
         log_dir = os.path.dirname(log_path)  # type: ignore[arg-type]
         os.makedirs(log_dir, exist_ok=True)
-        open(log_path, "w").close()  # type: ignore[arg-type]
+        with open(log_path, "w"):  # type: ignore[arg-type]
+            pass  # truncate any stale log before the run
         rw_binds.append(log_dir)
     qemu_cmd += [os.path.join(rootfs, rel_path), *args]
 
@@ -61,36 +63,51 @@ def run_binary(
 
     start = time.perf_counter()
     try:
-        proc = subprocess.run(
+        # start_new_session puts the child in its own process group so that, on
+        # timeout, we can kill the whole group — qemu plus anything the guest
+        # forked (e.g. a daemon it spawned). Under bwrap the pid namespace
+        # already contains those, but this also covers the rlimit-only tier.
+        proc = subprocess.Popen(
             argv,
             stdin=subprocess.DEVNULL,  # never let a binary block waiting on input
-            capture_output=True,
-            timeout=timeout_s,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             cwd=rootfs,
             preexec_fn=preexec,  # type: ignore[arg-type]  # None on bwrap/Windows
             env={"PATH": "/bin:/sbin:/usr/bin:/usr/sbin", "HOME": "/tmp"},
-            check=False,
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired as exc:
-        run.timed_out = True
-        run.duration_s = time.perf_counter() - start
-        run.stdout_tail = _tail(exc.stdout or b"")
-        run.stderr_tail = _tail(exc.stderr or b"")
-        if use_shim:
-            _read_shim_log(log_path, run)  # type: ignore[arg-type]
-        return run
     except OSError as exc:
         run.error = f"could not launch: {exc}"
         run.duration_s = time.perf_counter() - start
         return run
 
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        stdout, stderr = proc.communicate()
+        run.timed_out = True
+
     run.duration_s = time.perf_counter() - start
-    run.stdout_tail = _tail(proc.stdout)
-    run.stderr_tail = _tail(proc.stderr)
-    run.term_signal, run.returncode = _classify_exit(proc.returncode)
+    run.stdout_tail = _tail(stdout or b"")
+    run.stderr_tail = _tail(stderr or b"")
+    if not run.timed_out:
+        run.term_signal, run.returncode = _classify_exit(proc.returncode)
     if use_shim:
         _read_shim_log(log_path, run)  # type: ignore[arg-type]
     return run
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    """Kill the child's whole process group, falling back to the child alone."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, AttributeError, OSError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
 
 def _classify_exit(returncode: int | None) -> tuple[int | None, int | None]:

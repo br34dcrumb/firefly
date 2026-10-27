@@ -37,6 +37,7 @@ class ScanOptions:
     emulate_max: int = 64
     emulate_sandbox: bool = True  # False == --no-emulate-sandbox
     emulate_shim: bool = False
+    emulate_args: tuple[str, ...] = ()
 
 
 @dataclass
@@ -151,10 +152,11 @@ def _run_emulation(result: ScanResult, ctx: ScanContext, options: ScanOptions) -
 
         assert ctx.extraction is not None and ctx.inventory is not None
         emu_opts = EmulationOptions(
-            enabled=True,
             timeout_s=options.emulate_timeout,
             max_binaries=options.emulate_max,
+            jobs=options.jobs,
             require_sandbox=options.emulate_sandbox,
+            args=tuple(options.emulate_args),
             build_shim=options.emulate_shim,
             workdir=ctx.workdir,
         )

@@ -109,17 +109,23 @@ class EmulationResult:
                     Finding(
                         analyzer="emulation",
                         title=f"Binary crashed under emulation: {run.path} ({run.signal_name})",
-                        severity=Severity.HIGH,
-                        confidence="medium",
+                        # Medium, not high: firmware binaries often fault simply
+                        # because they were launched with no arguments, NVRAM or
+                        # config in an incomplete emulated environment, which is
+                        # not by itself a vulnerability. A crash reproduced on
+                        # attacker-supplied input (a later phase) warrants more.
+                        severity=Severity.MEDIUM,
+                        confidence="low",
                         path=run.path,
                         evidence=(run.stderr_tail or run.stdout_tail or "")[:240] or None,
                         description=(
                             f"{run.path} terminated with {run.signal_name} when run under "
-                            f"{run.qemu} with args {run.args or '(none)'}. A crash on launch or on "
-                            "trivial input is a strong signal of a memory-safety defect worth a "
-                            "closer look (and a candidate for fuzzing)."
+                            f"{run.qemu} with args {run.args or '(none)'}. This was a bare launch "
+                            "with no supplied input, so it may just be a missing-environment crash "
+                            "rather than a defect — but it is worth a closer look and is a prime "
+                            "candidate for fuzzing."
                         ),
-                        metadata={"signal": run.signal_name, "args": run.args, "qemu": run.qemu},
+                        metadata={"signal": run.signal_name, "args": run.args, "qemu": run.qemu, "bare_launch": True},
                     )
                 )
             # Runtime command execution observed through the shim: a binary that
