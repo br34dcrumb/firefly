@@ -7,6 +7,7 @@ only place that writes such content to disk.
 
 from __future__ import annotations
 
+import copy
 import os
 import posixpath
 import tarfile
@@ -80,9 +81,12 @@ def safe_extract_tar(
             stats.skipped.append(f"{member.name}: special file")
             return None
         if member.issym() and member.linkname.startswith("/"):
-            member = member.replace(linkname=rebase_absolute_link(member.name, member.linkname), deep=False)
+            # Mutate a copy, not tar's own TarInfo. (TarInfo.replace is 3.12+.)
+            member = copy.copy(member)
+            member.linkname = rebase_absolute_link(member.name, member.linkname)
         original_mode = member.mode
         try:
+            # data_filter returns a fresh TarInfo, so the mutations below are safe.
             member = tarfile.data_filter(member, path)
         except tarfile.FilterError as exc:
             stats.skipped.append(f"{member.name}: {exc}")
@@ -95,9 +99,9 @@ def safe_extract_tar(
         # Keep everything readable/traversable by us so analysis never trips
         # over a read-only directory baked into the image.
         if member.isdir():
-            member = member.replace(mode=(member.mode or 0) | 0o700, deep=False)
+            member.mode = (member.mode or 0) | 0o700
         elif member.isfile():
-            member = member.replace(mode=(member.mode or 0) | 0o600, deep=False)
+            member.mode = (member.mode or 0) | 0o600
         return member
 
     with tarfile.open(archive, "r:*") as tar:

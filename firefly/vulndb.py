@@ -19,6 +19,7 @@ import re
 import sqlite3
 import tempfile
 import urllib.request
+import zlib
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -26,7 +27,7 @@ from typing import IO, Any
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 FEED_REPO = "fkie-cad/nvd-json-data-feeds"
 RELEASE_API = f"https://api.github.com/repos/{FEED_REPO}/releases/latest"
 # The Modified feed covers changes from the last 8 days; refresh fully if older.
@@ -62,10 +63,30 @@ CREATE TABLE IF NOT EXISTS match (
     conditional INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS match_product ON match (product, vendor);
-CREATE INDEX IF NOT EXISTS match_cve ON match (cve_id);
+-- match_cve is created only when an incremental update needs it (see ensure_update_index);
+-- a full build never deletes, so it would be 68 MB of dead weight.
 """
 
 _METRIC_KEYS = (("cvssMetricV40", "4.0"), ("cvssMetricV31", "3.1"), ("cvssMetricV30", "3.0"), ("cvssMetricV2", "2.0"))
+
+
+def _compress(text: str | None) -> bytes | None:
+    """zlib-compress a description for storage (NVD text compresses ~3x)."""
+    return zlib.compress(text.encode("utf-8"), 6) if text else None
+
+
+def _decompress(blob: object) -> str:
+    """Inverse of _compress; tolerates legacy uncompressed TEXT descriptions."""
+    if blob is None:
+        return ""
+    if isinstance(blob, str):  # a pre-compression (schema < 3) database
+        return blob
+    if isinstance(blob, (bytes, bytearray)):
+        try:
+            return zlib.decompress(blob).decode("utf-8", "replace")
+        except zlib.error:
+            return bytes(blob).decode("utf-8", "replace")
+    return str(blob)
 _ARRAY_KEY = re.compile(r'"(?:cve_items|vulnerabilities|CVE_Items)"\s*:\s*\[')
 
 
@@ -167,7 +188,7 @@ def parse_record(rec: dict[str, Any]) -> ParsedCve | None:
         cwe,
         rec.get("cisaExploitAdd"),
         rec.get("cisaVulnerabilityName"),
-        description,
+        _compress(description),
         ",".join(sorted({t for entry in rec.get("cveTags", []) for t in entry.get("tags", [])})) or None,
     )
     matches = []
@@ -236,15 +257,29 @@ class VulnDB:
     def set_meta(self, key: str, value: str) -> None:
         self.conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
 
-    def upsert(self, records: Iterable[dict[str, Any]]) -> int:
-        """Insert or replace CVE records. Returns the number stored."""
+    def ensure_update_index(self) -> None:
+        """Create the index that makes replace/delete-by-CVE fast.
+
+        Only incremental updates need it; a full build never deletes, so this is
+        kept off the base schema to save ~68 MB on the shipped database."""
+        self.conn.execute("CREATE INDEX IF NOT EXISTS match_cve ON match (cve_id)")
+
+    def upsert(self, records: Iterable[dict[str, Any]], fresh: bool = False) -> int:
+        """Insert CVE records. Returns the number stored.
+
+        With ``fresh=True`` (a full build into an empty database) no delete runs,
+        so the match_cve index is not needed. Otherwise each CVE's prior match
+        rows are replaced, which needs that index — created on demand here."""
+        if not fresh:
+            self.ensure_update_index()
         count = 0
         batch_rows: list[tuple] = []
         batch_matches: list[tuple] = []
 
         def flush() -> None:
-            ids = [(r[0],) for r in batch_rows]
-            self.conn.executemany("DELETE FROM match WHERE cve_id = ?", ids)
+            if not fresh:
+                ids = [(r[0],) for r in batch_rows]
+                self.conn.executemany("DELETE FROM match WHERE cve_id = ?", ids)
             self.conn.executemany("INSERT OR REPLACE INTO cve VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", batch_rows)
             self.conn.executemany("INSERT INTO match VALUES (?,?,?,?,?,?,?,?,?,?)", batch_matches)
             batch_rows.clear()
@@ -254,7 +289,7 @@ class VulnDB:
             for rec in records:
                 parsed = parse_record(rec)
                 if parsed is None:
-                    if rec.get("vulnStatus") == "Rejected" and rec.get("id"):
+                    if not fresh and rec.get("vulnStatus") == "Rejected" and rec.get("id"):
                         self.conn.execute("DELETE FROM match WHERE cve_id = ?", (rec["id"],))
                         self.conn.execute("DELETE FROM cve WHERE id = ?", (rec["id"],))
                     continue
@@ -267,7 +302,7 @@ class VulnDB:
                 flush()
         return count
 
-    def candidates(self, product: str, vendor: str | None = None) -> list[sqlite3.Row]:
+    def candidates(self, product: str, vendor: str | None = None) -> list[dict[str, Any]]:
         self.conn.row_factory = sqlite3.Row
         sql = (
             "SELECT m.*, c.severity, c.score, c.cvss_version, c.vector, c.cwe, c.kev_added, c.kev_name, "
@@ -279,7 +314,12 @@ class VulnDB:
             args.append(vendor.lower())
         rows = self.conn.execute(sql, args).fetchall()
         self.conn.row_factory = None
-        return rows
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["description"] = _decompress(d.get("description"))
+            out.append(d)
+        return out
 
     def info(self) -> dict[str, Any]:
         cves = self.conn.execute("SELECT COUNT(*) FROM cve").fetchone()[0]
@@ -300,11 +340,11 @@ def open_feed(path: str) -> IO[str]:
     return open(path, encoding="utf-8")
 
 
-def import_files(db: VulnDB, paths: Iterable[str]) -> int:
+def import_files(db: VulnDB, paths: Iterable[str], fresh: bool = False) -> int:
     total = 0
     for path in paths:
         with open_feed(path) as fh:
-            n = db.upsert(iter_feed_records(fh))
+            n = db.upsert(iter_feed_records(fh), fresh=fresh)
         log.info("imported %d records from %s", n, path)
         total += n
     db.set_meta("updated_at", _now())
@@ -390,7 +430,7 @@ def update(path: str | None = None, full: bool = False, progress=print) -> dict[
             tmp = download_verified(asset["browser_download_url"], asset.get("digest"), os.path.dirname(os.path.abspath(path)))
             try:
                 with lzma.open(tmp, "rt", encoding="utf-8") as fh:
-                    n = db.upsert(iter_feed_records(fh))
+                    n = db.upsert(iter_feed_records(fh), fresh=not incremental)
             finally:
                 os.remove(tmp)
             progress(f"  {n} records")
@@ -399,6 +439,10 @@ def update(path: str | None = None, full: bool = False, progress=print) -> dict[
         db.set_meta("release", tag)
         db.set_meta("updated_at", _now())
         db.conn.commit()
+        if not incremental:
+            # Defragment and reclaim free pages from the fresh build.
+            progress("compacting database")
+            db.conn.execute("VACUUM")
         info = db.info()
     finally:
         db.close()

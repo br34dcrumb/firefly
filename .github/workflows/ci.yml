@@ -30,3 +30,27 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker build -t firefly .
       - run: docker run --rm --network none firefly --version
+
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write  # required to upload SARIF to code scanning
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -e .
+      - name: Build synthetic firmware and scan
+        run: |
+          python ci/make_sample.py sample.tar.gz
+          firefly scan sample.tar.gz -o out --sarif --skip cves
+          cp out/*/firefly.sarif firefly.sarif
+          python -c "import json,sys; d=json.load(open('firefly.sarif')); assert d['version']=='2.1.0'; n=len(d['runs'][0]['results']); print(n,'SARIF results'); sys.exit(0 if n else 1)"
+      - name: Upload SARIF to code scanning
+        if: github.event_name == 'push'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: firefly.sarif
+          category: firefly
