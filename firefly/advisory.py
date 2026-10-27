@@ -61,6 +61,9 @@ def render_advisory(item: DisclosureItem, *, researcher: str, vendor: str | None
         if item.category == "known_cves"
         else f"Requested coordinated-disclosure date: **{deadline}** (configurable). Please acknowledge receipt."
     )
+    # Built outside the f-string: an f-string expression cannot contain a
+    # backslash on Python < 3.12.
+    references = ("## References\n\n" + refs) if refs else ""
     return f"""# Security advisory (DRAFT): {item.title}
 
 > DRAFT for review. Verify every detail and the vendor contact before sending.
@@ -99,7 +102,7 @@ def render_advisory(item: DisclosureItem, *, researcher: str, vendor: str | None
 
 {contact_section(vendor, security_txt)}
 
-{("## References\n\n" + refs) if refs else ""}
+{references}
 """
 
 
