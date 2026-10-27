@@ -34,8 +34,10 @@ firefly scan path/to/squashfs-root/
 ```
 
 Each scan writes `firefly-out/<name>_<sha256[:12]>/` containing `firefly.json`
-(full results) and `sbom.cdx.json` (CycloneDX 1.6 SBOM with vulnerabilities),
-and prints a summary.
+(full results), `sbom.cdx.json` (CycloneDX 1.6 SBOM with vulnerabilities) and
+`firefly.html` (a single self-contained, offline report), and prints a summary.
+Add `--sarif` to also emit `firefly.sarif` for CI code-scanning; `--no-html`
+skips the HTML.
 
 ## Vulnerability database
 
@@ -61,8 +63,8 @@ database lives in `~/.cache/firefly/vulndb.sqlite` (override with `--db` or
 ```
 input ─▶ extract ─▶ inventory ─▶ analyzers ─▶ firefly.json
          unblob     walk once,    entropy      hardening    sbom.cdx.json
-         binwalk    hash, type    versions     dangerfns
-         tarfile    every file    cves         credentials
+         binwalk    hash, type    versions     dangerfns    firefly.html
+         tarfile    every file    cves         credentials  firefly.sarif (--sarif)
                                   (plugins)    accounts, services
 ```
 

@@ -27,6 +27,8 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--skip", action="append", default=[], metavar="ANALYZER", help="skip this analyzer (repeatable)")
     scan.add_argument("--db", metavar="PATH", help="vulnerability database (default: $FIREFLY_DB or ~/.cache/firefly)")
     scan.add_argument("--no-sbom", action="store_true", help="don't write a CycloneDX SBOM")
+    scan.add_argument("--no-html", action="store_true", help="don't write the HTML report")
+    scan.add_argument("--sarif", action="store_true", help="also write a SARIF file for CI (e.g. GitHub code scanning)")
     scan.add_argument(
         "--min-confidence",
         choices=["low", "medium", "high"],
@@ -97,10 +99,22 @@ def main(argv: list[str] | None = None) -> int:
         result = scan(args.input, options)
         report_path = write_json(result)
         sbom_path = None if args.no_sbom else sbom.write(result)
+        extra = []
+        if not args.no_html:
+            from firefly import htmlreport
+
+            extra.append(("html", htmlreport.write_result(result, os.path.join(result.workdir, "firefly.html"))))
+        if args.sarif:
+            from firefly import sarif
+            from firefly.report import to_dict
+
+            extra.append(("sarif", sarif.write(to_dict(result), os.path.join(result.workdir, "firefly.sarif"))))
         if args.quiet:
             print(report_path)
         else:
             print_summary(result, report_path, sbom_path, args.min_confidence)
+            for label, path in extra:
+                print(f"{label}: {path}")
         return 1 if any(e["stage"] == "extract" for e in result.errors) and not result.findings else 0
 
     build_parser().print_help()
