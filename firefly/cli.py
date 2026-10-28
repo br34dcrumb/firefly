@@ -84,6 +84,14 @@ def build_parser() -> argparse.ArgumentParser:
     disc.add_argument("--deadline-days", type=int, default=90, help="coordinated-disclosure window in days (default: %(default)s)")
     disc.add_argument("--min-confidence", choices=["low", "medium", "high"], default="medium", help="lowest confidence to include (default: %(default)s)")
     disc.add_argument("--include-cves", action="store_true", help="also create remediation items for already-public CVEs")
+
+    diff = sub.add_parser("diff", help="diff two scan reports: components, findings and CVEs added/removed between two firmware builds")
+    diff.add_argument("old", help="path to the older firefly.json (or a directory containing one)")
+    diff.add_argument("new", help="path to the newer firefly.json (or a directory containing one)")
+    diff.add_argument("-o", "--output", metavar="PATH", help="also write the diff as JSON to this path")
+    diff.add_argument("--json", action="store_true", help="print the diff as JSON instead of a summary table")
+    diff.add_argument("--min-confidence", choices=["low", "medium", "high"], default="medium", help="lowest finding confidence to compare (default: %(default)s)")
+    diff.add_argument("--fail-on-regression", action="store_true", help="exit non-zero if the newer build adds any CVE or non-info finding (for CI)")
     return parser
 
 
@@ -131,6 +139,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "disclose":
         return _disclose_command(args)
+
+    if args.command == "diff":
+        return _diff_command(args)
 
     if args.command == "scan":
         return _scan_command(args)
@@ -293,6 +304,32 @@ def _disclose_command(args: argparse.Namespace) -> int:
     print(f"  tracker: {tracker_path}")
     print("These are drafts. Review each one and confirm the vendor contact before sending; Firefly sends nothing.")
     return 0
+
+
+def _diff_command(args: argparse.Namespace) -> int:
+    import json
+
+    from firefly import fwdiff
+
+    try:
+        old = fwdiff.load_report(args.old)
+        new = fwdiff.load_report(args.new)
+    except fwdiff.DiffError as exc:
+        print(f"firefly: {exc}", file=sys.stderr)
+        return 2
+
+    diff = fwdiff.diff_reports(old, new, min_confidence=args.min_confidence)
+
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as fh:
+            json.dump(diff.to_dict(), fh, indent=2)
+    if args.json:
+        print(json.dumps(diff.to_dict(), indent=2))
+    else:
+        fwdiff.print_diff(diff)
+        if args.output:
+            print(f"diff: {args.output}")
+    return 1 if args.fail_on_regression and diff.has_regression else 0
 
 
 def _fpdb_command(args: argparse.Namespace) -> int:
