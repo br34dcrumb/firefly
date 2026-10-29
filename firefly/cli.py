@@ -30,6 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--no-file-inventory", action="store_true", help="don't record the per-file list in the report (disables file-level `firefly diff`)")
     scan.add_argument("--deep-reachability", action="store_true", help="use radare2 (if installed) to confirm CVE reachability via the call graph; heavier, opt-in")
     scan.add_argument("--deep-fingerprint", action="store_true", help="use radare2 (if installed) to match normalized function fingerprints (survives relocation/operand differences); heavier, opt-in")
+    scan.add_argument("--deep-taint", action="store_true", help="use radare2 (if installed) to trace whether external input can reach a dangerous sink (system/strcpy/...) via the call graph; heavier, opt-in")
     scan.add_argument("--no-sbom", action="store_true", help="don't write a CycloneDX SBOM")
     scan.add_argument("--no-html", action="store_true", help="don't write the HTML report")
     scan.add_argument("--sarif", action="store_true", help="also write a SARIF file for CI (e.g. GitHub code scanning)")
@@ -197,6 +198,7 @@ def _scan_command(args: argparse.Namespace) -> int:
         file_inventory=not args.no_file_inventory,
         deep_reachability=args.deep_reachability,
         deep_fingerprint=args.deep_fingerprint,
+        deep_taint=args.deep_taint,
         emulate=args.emulate,
         emulate_timeout=args.emulate_timeout,
         emulate_max=args.emulate_max,

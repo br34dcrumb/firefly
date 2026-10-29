@@ -132,6 +132,30 @@ def reachable_from(graph: dict[str, set[str]], sources: set[str], targets: set[s
     return False
 
 
+def input_reaches_sinks(graph: dict[str, set[str]], sink_names: set[str]) -> list[str]:
+    """Sink functions reachable from an external-input source in the call graph.
+
+    Returns the subset of ``sink_names`` for which some function that calls an
+    input source (``recv``/``read``/``getenv``/``nvram_get``/...) transitively
+    reaches a function that calls that sink.
+
+    This is call-graph **reachability**, NOT data-flow taint: a returned sink
+    means a *path* exists from an input-consuming function to the sink's caller,
+    not proof that a tainted value actually flows into the sink. Indirect and
+    function-pointer calls can both hide real paths and are invisible here, so a
+    hit is a candidate ("input can reach this sink") and a miss proves nothing.
+    Callers use it as a positive signal only — strengthen a finding on a hit,
+    change nothing on a miss.
+    """
+    input_sources = {n for n, callees in graph.items() if any(_basename(c) in INPUT_SOURCE_SYMBOLS for c in callees)}
+    reached: list[str] = []
+    for sink in sorted(sink_names):
+        targets = _nodes_named(graph, {sink})
+        if targets and reachable_from(graph, input_sources - targets, targets):
+            reached.append(sink)
+    return reached
+
+
 def function_reachable(graph: dict[str, set[str]], function_names: set[str]) -> tuple[bool, bool]:
     """Is a vulnerable function reachable in the call graph?
 

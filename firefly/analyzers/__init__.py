@@ -30,9 +30,11 @@ class ScanContext:
     db_path: str | None = None
     fpdb_path: str | None = None
     # Opt-in radare2-backed deep analysis (heavier): call-graph reachability
-    # for CVEs, and normalized function matching for fingerprinting.
+    # for CVEs, normalized function matching for fingerprinting, and
+    # input->sink reachability for dangerous functions.
     deep_reachability: bool = False
     deep_fingerprint: bool = False
+    deep_taint: bool = False
     # Components found by analyzers that already ran (analyzers run in order).
     components: list[Component] = field(default_factory=list)
 

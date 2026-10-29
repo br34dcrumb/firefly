@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 
+from firefly import disasm
 from firefly.analyzers import Analyzer, AnalyzerResult, ScanContext
 from firefly.analyzers.hardening import is_network_facing
 from firefly.elf import parse_file
@@ -35,6 +36,13 @@ DANGEROUS = {
 }
 # These are only worth surfacing in a binary that also handles the network.
 CONTEXT_ONLY = frozenset({"strcpy", "strcat", "sprintf", "vsprintf", "scanf", "sscanf", "memcpy", "strncpy"})
+
+_LEVELS = list(Severity)
+
+
+def _bump(sev: Severity) -> Severity:
+    """One severity rank higher, capped at CRITICAL."""
+    return _LEVELS[min(sev.rank + 1, len(_LEVELS) - 1)]
 
 
 class DangerousFunctionsAnalyzer(Analyzer):
@@ -69,16 +77,40 @@ class DangerousFunctionsAnalyzer(Analyzer):
                 sev = Severity.MEDIUM
             else:
                 sev = worst
+            confidence = "high" if any(DANGEROUS[f][0].rank >= Severity.HIGH.rank for f in flagged) else "medium"
             details = ", ".join(f"{f} ({DANGEROUS[f][1]})" for f in sorted(flagged, key=lambda f: -DANGEROUS[f][0].rank))
+            description = f"{'Network-facing binary' if exposed else 'Binary'} imports: {details}."
+            metadata = {"functions": sorted(flagged), "network_facing": exposed}
+
+            # Opt-in (radare2, heavy): does external input reach one of these
+            # sinks through the call graph? This is call-graph reachability, not
+            # data-flow taint — a found path is a candidate ("input can reach the
+            # sink's caller"), never proof a tainted value flows there. Positive
+            # signal only: a path raises severity/confidence and adds a note; a
+            # missing path (or absent radare2) leaves the finding exactly as it
+            # was. See disasm.input_reaches_sinks for the honest caveats.
+            if ctx.deep_taint:
+                graph = disasm.call_graph(ctx.inventory.abspath(rec))
+                if graph:
+                    reached = disasm.input_reaches_sinks(graph, set(flagged))
+                    metadata["taint"] = {"input_reaches_sink": bool(reached), "sinks": reached}
+                    if reached:
+                        sev = _bump(sev)
+                        confidence = "high"
+                        description += (
+                            f" External input can reach {', '.join(reached)} via the call graph "
+                            "(call-graph reachability, not proven data-flow taint)."
+                        )
+
             result.findings.append(
                 Finding(
                     analyzer=self.name,
                     title=f"Dangerous functions in {os.path.basename(rec.path)}: {', '.join(sorted(flagged))}",
                     severity=sev,
-                    confidence="medium" if not any(DANGEROUS[f][0].rank >= Severity.HIGH.rank for f in flagged) else "high",
+                    confidence=confidence,
                     path=rec.path,
-                    description=f"{'Network-facing binary' if exposed else 'Binary'} imports: {details}.",
-                    metadata={"functions": sorted(flagged), "network_facing": exposed},
+                    description=description,
+                    metadata=metadata,
                 )
             )
 
