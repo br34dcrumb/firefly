@@ -155,11 +155,21 @@ def test_file_diff_symlink_retarget_and_kind_change():
 
 
 def test_file_diff_unknown_hash_not_flagged():
-    # A file with no sha256 on either side (e.g. a device node) must not be
-    # reported as changed just because its content is unknowable.
-    old = _report(files=[_file("dev/null", None, kind="other")])
-    new = _report(files=[_file("dev/null", None, kind="other")])
+    # A file with no sha256 on either side (e.g. a device node) and the same
+    # size must not be reported as changed just because content is unknowable.
+    old = _report(files=[_file("dev/null", None, kind="other", size=0)])
+    new = _report(files=[_file("dev/null", None, kind="other", size=0)])
     assert diff_reports(old, new).files.changed == []
+
+
+def test_file_diff_size_fallback_for_unhashable():
+    # Two same-kind files that can't be hashed (e.g. over HASH_LIMIT) but whose
+    # sizes differ are a provable change and must be flagged.
+    old = _report(files=[_file("big.bin", None, size=600_000_000)])
+    new = _report(files=[_file("big.bin", None, size=800_000_000)])
+    changed = diff_reports(old, new).files.changed
+    assert [f["path"] for f in changed] == ["big.bin"]
+    assert changed[0]["old_size"] == 600_000_000 and changed[0]["new_size"] == 800_000_000
 
 
 def test_file_diff_unavailable_when_inventory_missing():

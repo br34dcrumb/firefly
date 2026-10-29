@@ -20,6 +20,10 @@ log = logging.getLogger(__name__)
 
 REPORT_SCHEMA = 2  # v2 adds the per-file inventory ("files") that firmware diffing uses
 
+# Above this file count the per-file inventory makes the report notably large;
+# warn so users who never diff know they can drop it (capping would corrupt diffs).
+FILE_INVENTORY_WARN = 50_000
+
 
 @dataclass
 class ScanOptions:
@@ -127,6 +131,11 @@ def scan(path: str, options: ScanOptions | None = None) -> ScanResult:
         if options.file_inventory:
             result.files = ctx.inventory.file_entries()
             result.file_inventory = True
+            if len(result.files) > FILE_INVENTORY_WARN:
+                result.warnings.append(
+                    f"recorded a {len(result.files)}-file inventory in the report (large JSON); "
+                    "pass --no-file-inventory to omit it if you won't run `firefly diff`"
+                )
         result.timings["inventory"] = round(time.perf_counter() - t0, 3)
 
     if options.run_static:

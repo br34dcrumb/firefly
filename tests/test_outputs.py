@@ -95,3 +95,16 @@ def test_html_write_result(report, tmp_path, monkeypatch):
     r = ScanResult(input_path="/fw/x.bin", input_sha256="abc", input_size=10, workdir=str(tmp_path), started="t")
     p = htmlreport.write_result(r, str(tmp_path / "r.html"))
     assert open(p, encoding="utf-8").read().lstrip().startswith("<!doctype html>")
+
+
+def test_to_dict_omits_files_unless_recorded(tmp_path):
+    # The diff relies on the "files" key's presence to tell "not recorded" from
+    # "genuinely empty", so to_dict must omit it when file_inventory is False.
+    from firefly.report import to_dict
+    from firefly.pipeline import ScanResult
+
+    base = dict(input_path="/fw/x.bin", input_sha256="abc", input_size=10, workdir=str(tmp_path), started="t")
+    assert "files" not in to_dict(ScanResult(**base))  # default: not recorded
+    recorded = ScanResult(**base, files=[{"path": "a", "kind": "data", "size": 1, "sha256": "h"}], file_inventory=True)
+    out = to_dict(recorded)
+    assert out["files"] == [{"path": "a", "kind": "data", "size": 1, "sha256": "h"}]

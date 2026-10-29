@@ -297,15 +297,20 @@ def _diff_files(old_files: list[dict], new_files: list[dict]) -> FileDiff:
         o, n = old_by_path[path], new_by_path[path]
         kind_changed = o.get("kind") != n.get("kind")
         oc, nc = _content_id(o), _content_id(n)
-        # Flag a change only when we can prove one: a kind change, or two known,
-        # differing content ids. An unknown id on either side is not a change.
-        if kind_changed or (oc is not None and nc is not None and oc != nc):
+        content_changed = oc is not None and nc is not None and oc != nc
+        # When content can't be hashed on either side (e.g. a file over
+        # inventory's HASH_LIMIT), a differing size still proves a change; use
+        # it as a fallback so large blobs aren't silently skipped.
+        size_changed = oc is None and nc is None and not kind_changed and o.get("size") != n.get("size")
+        if kind_changed or content_changed or size_changed:
             diff.changed.append({
                 "path": path,
                 "old_kind": o.get("kind"),
                 "new_kind": n.get("kind"),
                 "old": oc,
                 "new": nc,
+                "old_size": o.get("size"),
+                "new_size": n.get("size"),
             })
     diff.added.sort(key=lambda f: f["path"])
     diff.removed.sort(key=lambda f: f["path"])
@@ -391,7 +396,7 @@ def print_diff(diff: FirmwareDiff) -> None:
     if diff.files is None:
         console.print("[dim]file-level diff unavailable: re-scan both images without --no-file-inventory[/]")
     else:
-        _print_file_changes(console, Table, diff.files)
+        _print_file_changes(console, diff.files)
 
     nb = diff.findings.new_by_severity
     fb = diff.findings.fixed_by_severity
@@ -410,11 +415,13 @@ def _sorted_sev(counts: dict[str, int]) -> list[tuple[str, int]]:
 _MAX_FILES_SHOWN = 30
 
 
-def _print_file_changes(console, table_cls, files: FileDiff) -> None:
+def _print_file_changes(console, files: FileDiff) -> None:
+    # No "no change" line here: the summary row already shows files +0 -0 ~0.
     if not (files.added or files.removed or files.changed):
-        console.print("files: no change")
         return
-    table = table_cls(title=f"Files (+{len(files.added)} -{len(files.removed)} ~{len(files.changed)})")
+    from rich.table import Table
+
+    table = Table(title=f"Files (+{len(files.added)} -{len(files.removed)} ~{len(files.changed)})")
     table.add_column("Change")
     table.add_column("Path")
     rows = (
