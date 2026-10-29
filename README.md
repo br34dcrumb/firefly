@@ -101,6 +101,28 @@ List analyzers with `firefly analyzers`. Run a subset with `--only versions` or
 `--skip entropy`. Third-party analyzers subclass `firefly.analyzers.Analyzer`
 and register under the `firefly.analyzers` entry-point group.
 
+## Deep analysis (optional radare2 backend)
+
+Three `scan` flags sharpen the static results with a function call graph built by
+[radare2](https://github.com/radareorg/radare2). radare2 is an **optional,
+runtime-detected** external tool, in the same spirit as unblob and qemu: it only
+*reads* the binary (it does not execute firmware), but full analysis is heavy, so
+each is **off by default**. When radare2 is not installed every flag **degrades
+silently** to the normal behaviour of its analyzer.
+
+| Flag | Enhances | What it adds |
+|---|---|---|
+| `--deep-reachability` | `cves` | Confirms whether a CVE's vulnerable function is reached from an entrypoint or from external input via the call graph. |
+| `--deep-taint` | `dangerfns` | Reports whether external input (`recv`, `read`, `getenv`, `nvram_get`, …) can reach a dangerous sink (`system`, `popen`, `strcpy`, …) — turning "imports `system`" into "input can reach `system`". |
+| `--deep-fingerprint` | `fingerprint` | Also matches radare2-normalized (operand-invariant) function signatures, which survive relocation and operand differences the exact hash does not. |
+
+`--deep-reachability` and `--deep-taint` are **call-graph reachability, not
+data-flow taint**: a found path is a candidate ("input can reach the sink's
+caller"), not proof a tainted value flows there, and indirect/function-pointer
+calls can hide real paths. Both are a **positive signal only** — a path raises a
+finding's severity/confidence and adds a note; a missing path never hides or
+down-ranks the finding.
+
 ## Safety model
 
 Firmware is attacker-controlled. Firefly:
