@@ -93,6 +93,20 @@ def build_parser() -> argparse.ArgumentParser:
     diff.add_argument("--json", action="store_true", help="print the diff as JSON instead of a summary table")
     diff.add_argument("--min-confidence", choices=["low", "medium", "high"], default="medium", help="lowest finding confidence to compare (default: %(default)s)")
     diff.add_argument("--fail-on-regression", action="store_true", help="exit non-zero if the newer build adds any CVE or non-info finding (for CI)")
+
+    watch = sub.add_parser("watch", help="re-check a saved report's components against the current vuln DB for newly-published CVEs")
+    watch.add_argument("report", help="path to a firefly.json scan report (or a directory containing one)")
+    watch.add_argument("--db", metavar="PATH", help="vulnerability database (default: $FIREFLY_DB or ~/.cache/firefly)")
+    watch.add_argument("--since", metavar="YYYY-MM-DD", help="only report CVEs published or KEV-listed on/after this date")
+    watch.add_argument("--min-confidence", choices=["low", "medium", "high"], default="medium", help="lowest match confidence to report (default: %(default)s)")
+    watch.add_argument("--json", action="store_true", help="print results as JSON instead of a table")
+    watch.add_argument("--fail-on-new", action="store_true", help="exit non-zero if any new CVE is found (for cron/CI)")
+
+    comply = sub.add_parser("comply", help="map a scan report's findings to the OWASP IoT Top 10 (indicative, not an attestation)")
+    comply.add_argument("report", help="path to a firefly.json scan report (or a directory containing one)")
+    comply.add_argument("-o", "--output", metavar="PATH", help="also write the coverage as JSON to this path")
+    comply.add_argument("--json", action="store_true", help="print the coverage as JSON instead of a table")
+    comply.add_argument("--min-confidence", choices=["low", "medium", "high"], default="medium", help="lowest finding confidence to include (default: %(default)s)")
     return parser
 
 
@@ -143,6 +157,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "diff":
         return _diff_command(args)
+
+    if args.command == "watch":
+        return _watch_command(args)
+
+    if args.command == "comply":
+        return _comply_command(args)
 
     if args.command == "scan":
         return _scan_command(args)
@@ -331,6 +351,53 @@ def _diff_command(args: argparse.Namespace) -> int:
         if args.output:
             print(f"diff: {args.output}")
     return 1 if args.fail_on_regression and diff.has_regression else 0
+
+
+def _watch_command(args: argparse.Namespace) -> int:
+    import json
+
+    from firefly import fwdiff, watch
+    from firefly.vulndb import VulnDB
+
+    try:
+        report = fwdiff.load_report(args.report)
+    except fwdiff.DiffError as exc:
+        print(f"firefly: {exc}", file=sys.stderr)
+        return 2
+    db = VulnDB.open_existing(args.db)
+    if db is None:
+        print("firefly: no vulnerability database found; run `firefly db update`", file=sys.stderr)
+        return 1
+    with db:
+        new = watch.new_cves(report, db, min_confidence=args.min_confidence, since=args.since)
+    if args.json:
+        print(json.dumps(new, indent=2))
+    else:
+        watch.print_new(report, new, since=args.since)
+    return 1 if args.fail_on_new and new else 0
+
+
+def _comply_command(args: argparse.Namespace) -> int:
+    import json
+
+    from firefly import compliance, fwdiff
+
+    try:
+        report = fwdiff.load_report(args.report)
+    except fwdiff.DiffError as exc:
+        print(f"firefly: {exc}", file=sys.stderr)
+        return 2
+    coverage = compliance.map_report(report, min_confidence=args.min_confidence)
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as fh:
+            json.dump(coverage, fh, indent=2)
+    if args.json:
+        print(json.dumps(coverage, indent=2))
+    else:
+        compliance.print_coverage(coverage)
+        if args.output:
+            print(f"coverage: {args.output}")
+    return 0
 
 
 def _fpdb_command(args: argparse.Namespace) -> int:
