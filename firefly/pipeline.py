@@ -18,7 +18,7 @@ from firefly.models import Component, Finding
 
 log = logging.getLogger(__name__)
 
-REPORT_SCHEMA = 1
+REPORT_SCHEMA = 2  # v2 adds the per-file inventory ("files") that firmware diffing uses
 
 
 @dataclass
@@ -32,6 +32,7 @@ class ScanOptions:
     skip: list[str] = field(default_factory=list)
     db_path: str | None = None
     fpdb_path: str | None = None
+    file_inventory: bool = True  # emit the per-file list in the report (enables file-level diff)
     run_static: bool = True  # run the static analyzers (off for `firefly emulate`)
     emulate: bool = False  # opt-in dynamic emulation stage (executes binaries)
     emulate_timeout: float = 20.0
@@ -61,6 +62,8 @@ class ScanResult:
     finished: str = ""
     extraction: dict[str, Any] = field(default_factory=dict)
     inventory: dict[str, int] = field(default_factory=dict)
+    files: list[dict] = field(default_factory=list)
+    file_inventory: bool = False  # True once the per-file list was actually recorded
     timings: dict[str, float] = field(default_factory=dict)
     components: list[Component] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
@@ -121,6 +124,9 @@ def scan(path: str, options: ScanOptions | None = None) -> ScanResult:
         t0 = time.perf_counter()
         ctx.inventory = Inventory.build(ctx.extraction.scan_root, ctx.jobs, ctx.extraction.original_modes)
         result.inventory = ctx.inventory.stats()
+        if options.file_inventory:
+            result.files = ctx.inventory.file_entries()
+            result.file_inventory = True
         result.timings["inventory"] = round(time.perf_counter() - t0, 3)
 
     if options.run_static:

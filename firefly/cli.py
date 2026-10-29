@@ -27,6 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--skip", action="append", default=[], metavar="ANALYZER", help="skip this analyzer (repeatable)")
     scan.add_argument("--db", metavar="PATH", help="vulnerability database (default: $FIREFLY_DB or ~/.cache/firefly)")
     scan.add_argument("--fpdb", metavar="PATH", help="function-fingerprint database (default: $FIREFLY_FPDB or ~/.cache/firefly)")
+    scan.add_argument("--no-file-inventory", action="store_true", help="don't record the per-file list in the report (disables file-level `firefly diff`)")
     scan.add_argument("--no-sbom", action="store_true", help="don't write a CycloneDX SBOM")
     scan.add_argument("--no-html", action="store_true", help="don't write the HTML report")
     scan.add_argument("--sarif", action="store_true", help="also write a SARIF file for CI (e.g. GitHub code scanning)")
@@ -171,6 +172,7 @@ def _scan_command(args: argparse.Namespace) -> int:
         skip=args.skip,
         db_path=args.db,
         fpdb_path=args.fpdb,
+        file_inventory=not args.no_file_inventory,
         emulate=args.emulate,
         emulate_timeout=args.emulate_timeout,
         emulate_max=args.emulate_max,

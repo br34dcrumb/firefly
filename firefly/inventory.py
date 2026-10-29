@@ -142,6 +142,21 @@ class Inventory:
         counts["bytes"] = sum(r.size for r in self.records)
         return counts
 
+    def file_entries(self) -> list[dict]:
+        """Per-file inventory for the report, enabling file-level diffing.
+
+        Compact on purpose (path, kind, sha256, size, and a symlink's target):
+        enough to tell added/removed/changed files apart across two scans
+        without carrying the whole FileRecord.
+        """
+        out: list[dict] = []
+        for r in self.records:
+            entry: dict = {"path": r.path, "kind": r.kind.value, "size": r.size, "sha256": r.sha256}
+            if r.link_target is not None:
+                entry["link_target"] = r.link_target
+            out.append(entry)
+        return out
+
 
 @lru_cache(maxsize=256)
 def file_strings(abs_path: str, size: int, min_len: int = 4) -> str:

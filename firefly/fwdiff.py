@@ -85,15 +85,23 @@ class CveDelta:
 
 
 @dataclass
+class FileDiff:
+    added: list[dict[str, Any]] = field(default_factory=list)
+    removed: list[dict[str, Any]] = field(default_factory=list)
+    changed: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
 class FirmwareDiff:
     old_input: dict[str, Any]
     new_input: dict[str, Any]
     components: ComponentDiff
     findings: FindingDelta
     cves: CveDelta
+    files: FileDiff | None = None  # None when either report has no file inventory
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out = {
             "old": self.old_input,
             "new": self.new_input,
             "summary": self.summary(),
@@ -114,10 +122,16 @@ class FirmwareDiff:
                 "fixed": self.cves.fixed,
                 "still_present": self.cves.still_present,
             },
+            "files": None if self.files is None else {
+                "added": self.files.added,
+                "removed": self.files.removed,
+                "changed": self.files.changed,
+            },
         }
+        return out
 
     def summary(self) -> dict[str, int]:
-        return {
+        s = {
             "components_added": len(self.components.added),
             "components_removed": len(self.components.removed),
             "components_changed": len(self.components.changed),
@@ -129,6 +143,11 @@ class FirmwareDiff:
             "cves_still_present": len(self.cves.still_present),
             "new_kev": sum(1 for c in self.cves.new if c.get("kev")),
         }
+        if self.files is not None:
+            s["files_added"] = len(self.files.added)
+            s["files_removed"] = len(self.files.removed)
+            s["files_changed"] = len(self.files.changed)
+        return s
 
     @property
     def has_regression(self) -> bool:
@@ -256,6 +275,44 @@ def _diff_cves(old: list[dict], new: list[dict]) -> CveDelta:
     )
 
 
+def _content_id(entry: dict[str, Any]) -> str | None:
+    """What identifies this file's content: a symlink's target, else its sha256.
+    None means content can't be compared (unhashable file, read error)."""
+    if entry.get("kind") == "symlink":
+        return entry.get("link_target")
+    return entry.get("sha256")
+
+
+def _diff_files(old_files: list[dict], new_files: list[dict]) -> FileDiff:
+    old_by_path = {f["path"]: f for f in old_files if f.get("path")}
+    new_by_path = {f["path"]: f for f in new_files if f.get("path")}
+    diff = FileDiff()
+    for path in new_by_path.keys() - old_by_path.keys():
+        n = new_by_path[path]
+        diff.added.append({"path": path, "kind": n.get("kind"), "size": n.get("size")})
+    for path in old_by_path.keys() - new_by_path.keys():
+        o = old_by_path[path]
+        diff.removed.append({"path": path, "kind": o.get("kind"), "size": o.get("size")})
+    for path in old_by_path.keys() & new_by_path.keys():
+        o, n = old_by_path[path], new_by_path[path]
+        kind_changed = o.get("kind") != n.get("kind")
+        oc, nc = _content_id(o), _content_id(n)
+        # Flag a change only when we can prove one: a kind change, or two known,
+        # differing content ids. An unknown id on either side is not a change.
+        if kind_changed or (oc is not None and nc is not None and oc != nc):
+            diff.changed.append({
+                "path": path,
+                "old_kind": o.get("kind"),
+                "new_kind": n.get("kind"),
+                "old": oc,
+                "new": nc,
+            })
+    diff.added.sort(key=lambda f: f["path"])
+    diff.removed.sort(key=lambda f: f["path"])
+    diff.changed.sort(key=lambda f: f["path"])
+    return diff
+
+
 def diff_reports(old: dict[str, Any], new: dict[str, Any], min_confidence: str = "medium") -> FirmwareDiff:
     """Compute the delta between two scan reports.
 
@@ -264,12 +321,18 @@ def diff_reports(old: dict[str, Any], new: dict[str, Any], min_confidence: str =
     """
     old_f = _filter_confidence(old.get("findings", []), min_confidence)
     new_f = _filter_confidence(new.get("findings", []), min_confidence)
+    # File-level diff only when both reports carry a file inventory (schema >= 2
+    # scans without --no-file-inventory); otherwise it degrades to None.
+    files = None
+    if "files" in old and "files" in new:
+        files = _diff_files(old["files"], new["files"])
     return FirmwareDiff(
         old_input=_input_summary(old),
         new_input=_input_summary(new),
         components=_diff_components(old.get("components", []), new.get("components", [])),
         findings=_diff_findings(old_f, new_f),
         cves=_diff_cves(old_f, new_f),
+        files=files,
     )
 
 
@@ -285,12 +348,15 @@ def print_diff(diff: FirmwareDiff) -> None:
     console = Console()
     console.print(f"[bold]Firefly diff[/bold]  {diff.old_input.get('path')}  →  {diff.new_input.get('path')}")
     s = diff.summary()
-    console.print(
+    line = (
         f"components: [green]+{s['components_added']}[/] [red]-{s['components_removed']}[/] "
         f"~{s['components_changed']}   "
         f"CVEs: [red]+{s['cves_new']}[/] [green]-{s['cves_fixed']}[/] ={s['cves_still_present']}"
         + (f"   [bold red]{s['new_kev']} new KEV[/]" if s["new_kev"] else "")
     )
+    if diff.files is not None:
+        line += f"   files: [green]+{s['files_added']}[/] [red]-{s['files_removed']}[/] ~{s['files_changed']}"
+    console.print(line)
 
     if diff.components.changed or diff.components.added or diff.components.removed:
         table = Table(title="Components")
@@ -322,6 +388,11 @@ def print_diff(diff: FirmwareDiff) -> None:
             table.add_row(cve, f"{r['score']:.1f}" if r.get("score") is not None else "", name)
         console.print(table)
 
+    if diff.files is None:
+        console.print("[dim]file-level diff unavailable: re-scan both images without --no-file-inventory[/]")
+    else:
+        _print_file_changes(console, Table, diff.files)
+
     nb = diff.findings.new_by_severity
     fb = diff.findings.fixed_by_severity
     if diff.findings.new or diff.findings.fixed:
@@ -334,3 +405,25 @@ def print_diff(diff: FirmwareDiff) -> None:
 
 def _sorted_sev(counts: dict[str, int]) -> list[tuple[str, int]]:
     return sorted(counts.items(), key=lambda kv: -Severity(kv[0]).rank)
+
+
+_MAX_FILES_SHOWN = 30
+
+
+def _print_file_changes(console, table_cls, files: FileDiff) -> None:
+    if not (files.added or files.removed or files.changed):
+        console.print("files: no change")
+        return
+    table = table_cls(title=f"Files (+{len(files.added)} -{len(files.removed)} ~{len(files.changed)})")
+    table.add_column("Change")
+    table.add_column("Path")
+    rows = (
+        [("[yellow]~ changed[/]", f["path"]) for f in files.changed]
+        + [("[green]+ added[/]", f["path"]) for f in files.added]
+        + [("[red]- removed[/]", f["path"]) for f in files.removed]
+    )
+    for change, path in rows[:_MAX_FILES_SHOWN]:
+        table.add_row(change, path)
+    console.print(table)
+    if len(rows) > _MAX_FILES_SHOWN:
+        console.print(f"[dim]… and {len(rows) - _MAX_FILES_SHOWN} more file change(s); full list in --json / -o[/]")

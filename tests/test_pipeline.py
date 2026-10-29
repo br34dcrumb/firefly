@@ -95,8 +95,10 @@ def test_cli_writes_json(rootfs_tar, tmp_path, capsys):
     assert rc == 0
     report = capsys.readouterr().out.strip()
     data = json.loads(open(report, encoding="utf-8").read())
-    assert data["schema"] == 1
+    assert data["schema"] == 2
     assert any(c["cpe"].startswith("cpe:2.3:a:openssl:openssl:1.1.1k") for c in data["components"])
+    # schema 2 carries a per-file inventory with hashes for file-level diffing
+    assert data["files"] and all("path" in f and "sha256" in f for f in data["files"])
 
 
 def test_parallel_matches_serial(rootfs_tar, tmp_path, monkeypatch):

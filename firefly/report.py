@@ -13,7 +13,7 @@ from firefly.pipeline import REPORT_SCHEMA, ScanResult
 
 
 def to_dict(result: ScanResult) -> dict[str, Any]:
-    return {
+    out: dict[str, Any] = {
         "schema": REPORT_SCHEMA,
         "tool": {"name": "firefly", "version": __version__},
         "input": {"path": result.input_path, "sha256": result.input_sha256, "size": result.input_size},
@@ -28,6 +28,12 @@ def to_dict(result: ScanResult) -> dict[str, Any]:
         "errors": result.errors,
         "warnings": result.warnings,
     }
+    # Omit "files" entirely when the per-file inventory wasn't recorded, so a
+    # diff can tell "not recorded" apart from "genuinely empty" and degrade
+    # instead of reporting every file as added/removed.
+    if result.file_inventory:
+        out["files"] = result.files
+    return out
 
 
 def write_json(result: ScanResult, path: str | None = None) -> str:
