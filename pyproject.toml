@@ -24,7 +24,7 @@ packages = ["firefly", "firefly.analyzers", "firefly.data", "firefly.emulation"]
 version = { attr = "firefly.__version__" }
 
 [tool.setuptools.package-data]
-"firefly.data" = ["*.cfg"]
+"firefly.data" = ["*.cfg", "*.json"]
 "firefly.emulation" = ["shim/*.c", "shim/Makefile"]
 
 [tool.pytest.ini_options]

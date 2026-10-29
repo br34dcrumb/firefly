@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "note": "cve_id -> the function(s) that must be present for the CVE to apply. Used by reachability triage to down-rank (never drop) a CVE when none of its vulnerable functions are observable in the matched component's binaries. Keyed by canonical NVD product. Absence of a symbol is a hint, not proof (inlining / stripping / static linking can hide it), so it only lowers confidence.",
+  "products": {
+    "zlib": {
+      "CVE-2022-37434": ["inflate", "inflateGetHeader"],
+      "CVE-2018-25032": ["deflate", "deflate_stored"]
+    },
+    "openssl": {
+      "CVE-2022-0778": ["BN_mod_sqrt"]
+    }
+  }
+}

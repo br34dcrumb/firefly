@@ -57,6 +57,7 @@ class ElfInfo:
     needed: list[str] = field(default_factory=list)
     runpath: str | None = None
     imported_functions: set[str] = field(default_factory=set)
+    defined_functions: set[str] = field(default_factory=set)
     has_stack_canary: bool = False
     stripped: bool = True
     soname: str | None = None
@@ -240,9 +241,15 @@ def _parse_symbols(r: _Reader, e: str, is64: bool, data: bytes, shoff: int, shen
                 continue
             if name == "__stack_chk_fail":
                 info.has_stack_canary = True
-            # imported function = undefined symbol of type FUNC
-            if sh_type == SHT_DYNSYM and st_shndx == SHN_UNDEF and (st_info & 0xF) == STT_FUNC:
-                info.imported_functions.add(name)
+            if (st_info & 0xF) != STT_FUNC:
+                continue
+            # imported function = undefined symbol of type FUNC; a defined FUNC
+            # (any real section index) is one the binary provides itself.
+            if st_shndx == SHN_UNDEF:
+                if sh_type == SHT_DYNSYM:
+                    info.imported_functions.add(name)
+            elif st_shndx < 0xFF00:  # skip SHN_ABS / reserved pseudo-sections
+                info.defined_functions.add(name)
 
 
 MAX_ELF_BYTES = 256 * 1024**2  # don't load an implausibly large "ELF" into memory

@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from firefly.analyzers import Analyzer, AnalyzerResult, ScanContext
 from firefly.cvecheck import Range, description_agrees, fixed_in_branch, platform_only
 from firefly.models import Component, Finding, Severity
+from firefly.reachability import classify, component_symbols, load_cve_functions
 from firefly.vercmp import compare, in_range
 from firefly.vulndb import SCHEMA_VERSION, VulnDB
 
@@ -105,35 +106,70 @@ class CveAnalyzer(Analyzer):
             if info.get("schema") != str(SCHEMA_VERSION):
                 result.warnings.append("vulnerability database uses an older schema; run `firefly db update` to rebuild it")
             result.artifacts["database"] = {k: info[k] for k in ("release", "updated_at", "cves")}
+            cve_functions = load_cve_functions()
+            reach_counts = {"reachable": 0, "not_present": 0}
             for comp in ctx.components:
+                # Symbols are gathered once per component, lazily, and only for
+                # products we actually have reachability data for.
+                has_reach_data = ctx.inventory is not None and comp.product.lower() in cve_functions
+                comp_syms: tuple[set[str], bool] | None = None
                 for cve, m in sorted(match_component(db, comp).items()):
                     row = m.row
                     kev = row["kev_added"] is not None
+                    severity = SEVERITY.get(row["severity"] or "", Severity.MEDIUM)
                     title = f"{cve} in {comp.product} {comp.version}" + (" (known exploited)" if kev else "")
+                    confidence = m.confidence
+                    reasons = list(m.reasons)
+                    reachability = None
+                    if has_reach_data:
+                        if comp_syms is None:
+                            comp_syms = component_symbols(comp.paths, ctx.inventory)
+                        observed, known = comp_syms
+                        reach = classify(cve, comp.product, observed, known, cve_functions)
+                        if reach.status != "unknown":
+                            reachability = {"status": reach.status, "functions": reach.functions, "present": reach.present}
+                            reach_counts[reach.status] += 1
+                            if reach.status == "not_present":
+                                reasons.append(
+                                    f"vulnerable function(s) {', '.join(reach.functions)} are absent from the matched "
+                                    "binary (may be compiled out, inlined, or stripped)"
+                                )
+                                # Down-rank out of the default view — but never
+                                # hide a known-exploited or critical CVE on a
+                                # symbol-presence guess that can be wrong.
+                                if not kev and severity is not Severity.CRITICAL:
+                                    confidence = "low"
+                            else:
+                                reasons.append(f"binary references vulnerable function(s): {', '.join(reach.present)}")
+                    metadata = {
+                        "cve": cve,
+                        "cvss_score": row["score"],
+                        "cvss_version": row["cvss_version"],
+                        "cvss_vector": row["vector"],
+                        "cwe": row["cwe"],
+                        "kev": kev,
+                        "kev_added": row["kev_added"],
+                        "published": row["published"],
+                        "confidence_reasons": reasons,
+                        "component": {"vendor": comp.vendor, "product": comp.product, "version": comp.version, "cpe": comp.cpe},
+                        "paths": comp.paths,
+                        "url": f"https://nvd.nist.gov/vuln/detail/{cve}",
+                    }
+                    if reachability is not None:
+                        metadata["reachability"] = reachability
                     result.findings.append(
                         Finding(
                             analyzer=self.name,
                             title=title,
-                            severity=SEVERITY.get(row["severity"] or "", Severity.MEDIUM),
-                            confidence=m.confidence,
+                            severity=severity,
+                            confidence=confidence,
                             path=comp.paths[0] if comp.paths else None,
                             description=(row["description"] or "")[:1000],
-                            metadata={
-                                "cve": cve,
-                                "cvss_score": row["score"],
-                                "cvss_version": row["cvss_version"],
-                                "cvss_vector": row["vector"],
-                                "cwe": row["cwe"],
-                                "kev": kev,
-                                "kev_added": row["kev_added"],
-                                "published": row["published"],
-                                "confidence_reasons": m.reasons,
-                                "component": {"vendor": comp.vendor, "product": comp.product, "version": comp.version, "cpe": comp.cpe},
-                                "paths": comp.paths,
-                                "url": f"https://nvd.nist.gov/vuln/detail/{cve}",
-                            },
+                            metadata=metadata,
                         )
                     )
+            if reach_counts["reachable"] or reach_counts["not_present"]:
+                result.artifacts["reachability"] = reach_counts
             low = sum(1 for f in result.findings if f.confidence == "low")
             result.artifacts["confidence"] = {c: sum(1 for f in result.findings if f.confidence == c) for c in CONFIDENCE_ORDER}
             if low:

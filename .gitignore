@@ -48,3 +48,8 @@ concepts_brief.md
 # Planning docs kept out of the tree
 ROADMAP.md
 CLAUDE.md
+
+# Local py env related files
+py-readme.txt
+requirements-env.txt
+requirements-venv.txt
