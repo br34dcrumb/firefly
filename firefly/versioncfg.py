@@ -295,3 +295,25 @@ def parse_rules(text: str) -> tuple[list[VersionRule], list[str]]:
 def load_default_rules() -> tuple[list[VersionRule], list[str]]:
     text = resources.files("firefly.data").joinpath("bin_version_strings.cfg").read_text(encoding="utf-8")
     return parse_rules(text)
+
+
+# Bundled rule sets selectable by name. "emba" is the broad GPL-3.0 EMBA file;
+# "native" is Firefly's own clean-room set (its own licence), smaller but
+# unencumbered. `scan --version-config` takes one of these names or a file path.
+_BUNDLED = {"emba": "bin_version_strings.cfg", "native": "firefly_version_strings.cfg"}
+
+
+def load_rules(source: str | None = None) -> tuple[list[VersionRule], list[str]]:
+    """Load version rules from a bundled set name ("emba"/"native") or a path.
+
+    ``None`` keeps the default (EMBA). A value matching a bundled name loads that
+    packaged file; anything else is treated as a filesystem path to a cfg in the
+    same ``name;mode;license;"grep";"sed"`` format.
+    """
+    if source is None or source == "emba":
+        return load_default_rules()
+    if source in _BUNDLED:
+        text = resources.files("firefly.data").joinpath(_BUNDLED[source]).read_text(encoding="utf-8")
+        return parse_rules(text)
+    with open(source, encoding="utf-8") as fh:
+        return parse_rules(fh.read())

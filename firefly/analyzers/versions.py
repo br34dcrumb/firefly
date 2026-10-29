@@ -9,16 +9,16 @@ from firefly.analyzers import Analyzer, AnalyzerResult, ScanContext
 from firefly.components import merge, suppress_multicall
 from firefly.inventory import file_strings
 from firefly.models import Component
-from firefly.versioncfg import VersionRule, load_default_rules
+from firefly.versioncfg import VersionRule, load_rules
 
 _RULES: list[VersionRule] | None = None
 # Below this many binaries, process start-up costs more than it saves.
 PARALLEL_MIN_TASKS = 8
 
 
-def _init_worker() -> None:
+def _init_worker(source: str | None = None) -> None:
     global _RULES
-    _RULES, _ = load_default_rules()
+    _RULES, _ = load_rules(source)
 
 
 def _rules() -> list[VersionRule]:
@@ -75,7 +75,7 @@ class VersionAnalyzer(Analyzer):
     def run(self, ctx: ScanContext) -> AnalyzerResult:
         assert ctx.inventory is not None
         result = AnalyzerResult()
-        rules, errors = load_default_rules()
+        rules, errors = load_rules(ctx.version_config)
         if errors:
             result.artifacts["rule_errors"] = errors
         tasks = [
@@ -84,9 +84,10 @@ class VersionAnalyzer(Analyzer):
             if r.is_executable_code
         ]
         if ctx.jobs > 1 and len(tasks) > PARALLEL_MIN_TASKS:
-            with ProcessPoolExecutor(max_workers=ctx.jobs, initializer=_init_worker) as pool:
+            with ProcessPoolExecutor(max_workers=ctx.jobs, initializer=_init_worker, initargs=(ctx.version_config,)) as pool:
                 outputs = list(pool.map(_scan_file, tasks, chunksize=8))
         else:
+            _init_worker(ctx.version_config)  # populate the module-level rules for the serial path
             outputs = [_scan_file(t) for t in tasks]
 
         components: dict[tuple[str, str, str], Component] = {}

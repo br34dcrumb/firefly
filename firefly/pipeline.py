@@ -37,6 +37,7 @@ class ScanOptions:
     skip: list[str] = field(default_factory=list)
     db_path: str | None = None
     fpdb_path: str | None = None
+    version_config: str | None = None  # version-rule set: "emba" (default), "native", or a cfg path
     file_inventory: bool = True  # emit the per-file list in the report (enables file-level diff)
     deep_reachability: bool = False  # confirm CVE reachability via radare2's call graph (opt-in, heavier)
     deep_fingerprint: bool = False  # match radare2-normalized function fingerprints (opt-in, heavier)
@@ -117,7 +118,7 @@ def scan(path: str, options: ScanOptions | None = None) -> ScanResult:
     file_strings.cache_clear()
 
     result = ScanResult(path, digest, size, workdir, started=_now())
-    ctx = ScanContext(firmware_path=path, workdir=workdir, jobs=max(1, options.jobs), db_path=options.db_path, fpdb_path=options.fpdb_path, deep_reachability=options.deep_reachability, deep_fingerprint=options.deep_fingerprint, deep_taint=options.deep_taint)
+    ctx = ScanContext(firmware_path=path, workdir=workdir, jobs=max(1, options.jobs), db_path=options.db_path, fpdb_path=options.fpdb_path, version_config=options.version_config, deep_reachability=options.deep_reachability, deep_fingerprint=options.deep_fingerprint, deep_taint=options.deep_taint)
 
     t0 = time.perf_counter()
     try:

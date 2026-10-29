@@ -27,6 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--skip", action="append", default=[], metavar="ANALYZER", help="skip this analyzer (repeatable)")
     scan.add_argument("--db", metavar="PATH", help="vulnerability database (default: $FIREFLY_DB or ~/.cache/firefly)")
     scan.add_argument("--fpdb", metavar="PATH", help="function-fingerprint database (default: $FIREFLY_FPDB or ~/.cache/firefly)")
+    scan.add_argument("--version-config", metavar="SET_OR_PATH", help="version-identifier rules: 'emba' (default, GPL-3.0), 'native' (Firefly's own clean-room set), or a path to a cfg")
     scan.add_argument("--no-file-inventory", action="store_true", help="don't record the per-file list in the report (disables file-level `firefly diff`)")
     scan.add_argument("--deep-reachability", action="store_true", help="use radare2 (if installed) to confirm CVE reachability via the call graph; heavier, opt-in")
     scan.add_argument("--deep-fingerprint", action="store_true", help="use radare2 (if installed) to match normalized function fingerprints (survives relocation/operand differences); heavier, opt-in")
@@ -195,6 +196,7 @@ def _scan_command(args: argparse.Namespace) -> int:
         skip=args.skip,
         db_path=args.db,
         fpdb_path=args.fpdb,
+        version_config=args.version_config,
         file_inventory=not args.no_file_inventory,
         deep_reachability=args.deep_reachability,
         deep_fingerprint=args.deep_fingerprint,

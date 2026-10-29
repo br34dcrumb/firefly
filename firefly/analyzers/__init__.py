@@ -29,6 +29,9 @@ class ScanContext:
     inventory: Inventory | None = None
     db_path: str | None = None
     fpdb_path: str | None = None
+    # Version-rule source for the `versions` analyzer: a bundled set name
+    # ("emba"/"native") or a path to a cfg; None keeps the default (EMBA).
+    version_config: str | None = None
     # Opt-in radare2-backed deep analysis (heavier): call-graph reachability
     # for CVEs, normalized function matching for fingerprinting, and
     # input->sink reachability for dangerous functions.

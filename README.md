@@ -175,6 +175,13 @@ Keep firmware samples in `samples/` (git-ignored). Never commit firmware.
 
 ## Licensing note
 
-`bin_version_strings.cfg` comes from EMBA, which is licensed GPL-3.0. Firefly
-must therefore be distributed under GPL-3.0-compatible terms, or that rule set
-must be replaced before Firefly ships under another licence.
+`bin_version_strings.cfg` comes from EMBA, which is licensed GPL-3.0. While it is
+the default version-rule set, Firefly must be distributed under GPL-3.0-compatible
+terms.
+
+Firefly also ships a clean-room alternative, `firefly/data/firefly_version_strings.cfg`
+— its own rules, authored from the observable version strings of common firmware
+packages, with no GPL constraint. Select it with `firefly scan --version-config
+native` (or point `--version-config` at any cfg of your own). It is deliberately
+smaller than EMBA's set and grows over time; once its coverage is sufficient it
+can become the default, letting Firefly ship free of the GPL obligation.
