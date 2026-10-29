@@ -311,27 +311,45 @@ def build_qemu_command(qemu_path: str, machine: str, kernel: str, image: str | N
     return cmd
 
 
-def run_system(extraction: ExtractionResult, inv: Inventory, options: SystemOptions) -> SystemBootResult:
-    """Attempt a full-system boot of the extracted firmware and probe services."""
+@dataclass
+class _BootPlan:
+    """Everything needed to launch a boot, produced by the preflight checks."""
+
+    argv: list[str]
+    preexec: Any
+    scan_root: str
+    guest_ports: list[int]
+
+
+def _plan_boot(extraction: ExtractionResult, inv: Inventory, options: SystemOptions) -> tuple[SystemBootResult, _BootPlan | None]:
+    """Run the preflight checks and assemble the qemu-system launch.
+
+    Returns ``(result, plan)``. ``plan`` is None when the boot cannot even be
+    attempted (wrong OS, no qemu, no kernel, sandbox refusal); ``result`` then
+    carries ``available=False`` and the reason. On success ``result`` has the
+    qemu/machine/kernel fields filled and ``plan`` holds the argv to launch.
+    Shared by :func:`run_system` (one-shot) and :func:`open_live_target` (held
+    open for Phase C), so the two can never drift.
+    """
     if not sys.platform.startswith("linux"):
-        return SystemBootResult(available=False, reason="full-system emulation requires Linux (qemu-system)")
+        return SystemBootResult(available=False, reason="full-system emulation requires Linux (qemu-system)"), None
 
     # Architecture comes from the dominant executable in the image.
     arch = _dominant_arch(inv)
     if arch is None:
-        return SystemBootResult(available=False, reason="could not determine the image's architecture")
+        return SystemBootResult(available=False, reason="could not determine the image's architecture"), None
     machine_name, endian = arch
     program = qemu_system_program(machine_name, endian)
     if program is None:
-        return SystemBootResult(available=False, reason=f"no qemu-system mapping for {machine_name}/{endian}")
+        return SystemBootResult(available=False, reason=f"no qemu-system mapping for {machine_name}/{endian}"), None
     qemu_path = find_qemu_system(program)
     if qemu_path is None:
-        return SystemBootResult(available=False, reason=f"{program} is not installed")
+        return SystemBootResult(available=False, reason=f"{program} is not installed"), None
 
     policy = SandboxPolicy(require_isolation=options.require_sandbox, use_bwrap=options.require_sandbox)
     tier, refusal = detect_tier(policy)
     if refusal:
-        return SystemBootResult(available=False, reason=refusal)
+        return SystemBootResult(available=False, reason=refusal), None
 
     kernel = options.kernel or find_kernel(extraction.extract_dir)
     if not kernel:
@@ -339,7 +357,7 @@ def run_system(extraction: ExtractionResult, inv: Inventory, options: SystemOpti
             available=False,
             reason="no kernel found in the image; supply one with --system-kernel",
             qemu=os.path.basename(qemu_path),
-        )
+        ), None
 
     machine = options.machine or default_machine(machine_name, endian)
     nic = options.nic or _DEFAULT_NIC.get(machine, "e1000")
@@ -364,14 +382,22 @@ def run_system(extraction: ExtractionResult, inv: Inventory, options: SystemOpti
     argv, preexec = build_command(
         tier, policy, extraction.scan_root, qemu_cmd, extra_ro=extra_ro, allow_network=True,
     )
+    return result, _BootPlan(argv=argv, preexec=preexec, scan_root=extraction.scan_root, guest_ports=guest_ports)
 
-    console, open_ports = _boot(argv, preexec, extraction.scan_root, guest_ports, options)
+
+def run_system(extraction: ExtractionResult, inv: Inventory, options: SystemOptions) -> SystemBootResult:
+    """Attempt a full-system boot of the extracted firmware and probe services."""
+    result, plan = _plan_boot(extraction, inv, options)
+    if plan is None:
+        return result
+
+    console, open_ports = _boot(plan.argv, plan.preexec, plan.scan_root, plan.guest_ports, options)
     result.console_tail = console
     # If *every* forwarded port looks open, the guest never became reachable
     # (slirp accepts the host side but has no guest to connect to, so each probe
     # just times out). A real device does not listen on all of these, so treat
     # this as "no services reliably detected" rather than a wall of false hits.
-    if len(open_ports) >= len(guest_ports):
+    if len(open_ports) >= len(plan.guest_ports):
         open_ports = []
     result.open_ports = open_ports
     result.booted, result.boot_reason = classify_console(console)
@@ -381,56 +407,152 @@ def run_system(extraction: ExtractionResult, inv: Inventory, options: SystemOpti
     return result
 
 
-def _boot(argv: list[str], preexec, cwd: str, guest_ports: list[int], options: SystemOptions) -> tuple[str, list[int]]:
-    """Run qemu-system, capture serial, probe ports after it settles, then stop."""
-    buf = bytearray()
-    try:
-        proc = subprocess.Popen(
-            argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            cwd=cwd, preexec_fn=preexec, start_new_session=True,
-            env={"PATH": "/bin:/sbin:/usr/bin:/usr/sbin", "HOME": "/tmp"},
-        )
-    except OSError as exc:
-        return f"could not launch qemu-system: {exc}", []
+def open_live_target(extraction: ExtractionResult, inv: Inventory, options: SystemOptions) -> tuple["LiveTarget | None", SystemBootResult]:
+    """Prepare a bootable guest and return it as a not-yet-started LiveTarget.
 
-    def reader() -> None:
-        assert proc.stdout is not None
+    This is the Phase C entry point: the caller enters the target (which boots
+    and waits for readiness), interacts with its forwarded localhost ports while
+    it stays alive, then leaves the ``with`` block to tear it down. ::
+
+        target, result = open_live_target(extraction, inv, options)
+        if target is None:
+            ...  # result.reason says why it could not boot
+        else:
+            with target:
+                for port in target.probe():
+                    host = target.host_port(port)  # 127.0.0.1:host reaches the guest
+
+    Returns ``(None, result)`` when the boot cannot be attempted (``result``
+    explains why), mirroring :func:`run_system`'s preflight exactly.
+    """
+    result, plan = _plan_boot(extraction, inv, options)
+    if plan is None:
+        return None, result
+    return LiveTarget(plan.argv, plan.preexec, plan.scan_root, plan.guest_ports, options), result
+
+
+class LiveTarget:
+    """A booted full-system guest held open for interaction (Phase C substrate).
+
+    Boots ``qemu-system``, waits until the guest is ready (a boot marker on the
+    serial console, then a short grace for services to bind), and then stays
+    alive so a caller can probe or drive its forwarded localhost ports. Those
+    ports are the only way in — slirp NATs the guest, so there is no raw network
+    access, and the whole qemu process already runs inside the Phase B sandbox.
+
+    Always stop it with :meth:`close` or the ``with`` statement: that kills the
+    qemu process group. Reuse across phases goes through :func:`open_live_target`,
+    which runs the shared preflight and hands back an unstarted instance.
+    """
+
+    def __init__(self, argv: list[str], preexec: Any, cwd: str, guest_ports: list[int], options: SystemOptions):
+        self.argv = argv
+        self._preexec = preexec
+        self._cwd = cwd
+        self.guest_ports = list(guest_ports)
+        self.options = options
+        self._buf = bytearray()
+        self._proc: subprocess.Popen | None = None
+        self._reader: threading.Thread | None = None
+        self._started = False
+        self.open_ports: list[int] = []
+        self.booted = False
+        self.boot_reason = ""
+
+    def host_port(self, guest_port: int) -> int:
+        """The ``127.0.0.1`` port that forwards to ``guest_port`` on the device."""
+        return _host_port(guest_port)
+
+    @property
+    def console(self) -> str:
+        """The serial console captured so far (decoded, replacing bad bytes)."""
+        return bytes(self._buf).decode("utf-8", "replace")
+
+    def start(self) -> "LiveTarget":
+        """Launch qemu-system and block until the guest is ready (or gives up).
+
+        Idempotent: calling it again is a no-op. On a launch failure the error
+        is recorded on the console and ``booted`` stays False, never raising.
+        """
+        if self._started:
+            return self
+        self._started = True
+        try:
+            self._proc = subprocess.Popen(
+                self.argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                cwd=self._cwd, preexec_fn=self._preexec, start_new_session=True,
+                env={"PATH": "/bin:/sbin:/usr/bin:/usr/sbin", "HOME": "/tmp"},
+            )
+        except OSError as exc:
+            self._buf.extend(f"could not launch qemu-system: {exc}".encode())
+            return self
+        self._reader = threading.Thread(target=self._read, daemon=True)
+        self._reader.start()
+        self._wait_ready()
+        self.booted, self.boot_reason = classify_console(self.console)
+        return self
+
+    def _read(self) -> None:
+        assert self._proc is not None and self._proc.stdout is not None
         # read1() returns whatever is available instead of blocking for a full
         # fixed-size chunk, so a short trailing line (e.g. the "login:" marker,
         # after which the guest goes quiet) is seen promptly rather than only on
-        # EOF. buf.extend (not buf += ...) keeps buf the enclosing bytearray; an
-        # augmented assignment would make it local and raise UnboundLocalError.
-        for chunk in iter(lambda: proc.stdout.read1(65536), b""):
-            if len(buf) < MAX_CONSOLE:
-                buf.extend(chunk)
+        # EOF. buf.extend (not buf += ...) keeps buf the instance attribute.
+        for chunk in iter(lambda: self._proc.stdout.read1(65536), b""):
+            if len(self._buf) < MAX_CONSOLE:
+                self._buf.extend(chunk)
 
-    t = threading.Thread(target=reader, daemon=True)
-    t.start()
+    def _wait_ready(self) -> None:
+        # Wait for the device to settle before anyone probes. Probing early is
+        # wrong: before the guest's network is up, slirp accepts the host
+        # connection and sits waiting on an unreachable guest, which the recv
+        # heuristic reads as a silent-but-open service — a false positive on
+        # every forwarded port. So we wait for a boot marker on the console (then
+        # a short grace for services to bind), or for the process to exit / the
+        # timeout.
+        assert self._proc is not None
+        start = time.monotonic()
+        while time.monotonic() - start < self.options.timeout_s:
+            if self._proc.poll() is not None:
+                break
+            text = self.console
+            booted, _ = classify_console(text)
+            if booted:
+                remaining = self.options.timeout_s - (time.monotonic() - start)
+                time.sleep(max(0.0, min(self.options.service_grace_s, remaining)))
+                break
+            if any(marker in text for marker in _BOOT_FAIL):
+                break
+            time.sleep(1.0)
 
-    # Probe exactly once, when the device is settled. Probing early is wrong:
-    # before the guest's network is up, slirp accepts the host connection and
-    # sits waiting on an unreachable guest, which the recv heuristic reads as a
-    # silent-but-open service — a false positive on every forwarded port. So we
-    # wait for a boot marker on the console (then a short grace for services to
-    # bind), or for the process to exit / the timeout, and probe just once.
-    start = time.monotonic()
-    while time.monotonic() - start < options.timeout_s:
-        if proc.poll() is not None:
-            break
-        text = bytes(buf).decode("utf-8", "replace")
-        booted, _ = classify_console(text)
-        if booted:
-            remaining = options.timeout_s - (time.monotonic() - start)
-            time.sleep(max(0.0, min(options.service_grace_s, remaining)))
-            break
-        if any(marker in text for marker in _BOOT_FAIL):
-            break
-        time.sleep(1.0)
+    def probe(self) -> list[int]:
+        """Probe the forwarded ports and record which the guest is listening on."""
+        self.open_ports = _probe_ports(self.guest_ports)
+        return self.open_ports
 
-    open_ports = _probe_ports(guest_ports)
-    _kill_group(proc)
-    t.join(timeout=2.0)
-    return bytes(buf).decode("utf-8", "replace"), open_ports
+    def close(self) -> None:
+        """Kill the qemu process group and join the console reader. Idempotent."""
+        if self._proc is not None:
+            _kill_group(self._proc)
+        if self._reader is not None:
+            self._reader.join(timeout=2.0)
+
+    def __enter__(self) -> "LiveTarget":
+        return self.start()
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+
+def _boot(argv: list[str], preexec, cwd: str, guest_ports: list[int], options: SystemOptions) -> tuple[str, list[int]]:
+    """One-shot boot: start the guest, probe once when settled, then stop.
+
+    The single-probe wrapper :func:`run_system` uses; Phase C uses
+    :class:`LiveTarget` directly to keep the guest alive across many probes.
+    """
+    with LiveTarget(argv, preexec, cwd, guest_ports, options) as target:
+        open_ports = target.probe()
+        return target.console, open_ports
 
 
 def _dominant_arch(inv: Inventory) -> tuple[str, str] | None:

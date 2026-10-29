@@ -8,6 +8,11 @@ pass on any OS without qemu-system installed.
 
 from __future__ import annotations
 
+import io
+import time as _time
+
+_REAL_SLEEP = _time.sleep  # captured before any test patches time.sleep
+
 import firefly.emulation.system as system
 from firefly.emulation.system import (
     SystemBootResult,
@@ -198,3 +203,88 @@ def test_run_system_boots_and_probes(tmp_path, monkeypatch):
     sev = {f.title: f.severity for f in res.to_findings()}
     assert any("booted" in t for t in sev)
     assert any("telnet" in t for t in sev)
+
+
+# --------------------------------------------------------------------------- LiveTarget (Phase C substrate)
+
+
+class _FakeProc:
+    """Stand-in for a qemu-system Popen: a BytesIO console and a kill flag."""
+
+    def __init__(self, output: bytes):
+        self.stdout = io.BytesIO(output)
+        self.pid = 999999
+        self.killed = False
+        self._exited = False
+
+    def poll(self):
+        return 0 if self._exited else None
+
+    def kill(self):
+        self.killed = True
+        self._exited = True
+
+
+def _fast_sleep(monkeypatch):
+    # Keep _wait_ready's loop responsive without a real 1s tick, while still
+    # yielding the GIL so the console reader thread can run.
+    monkeypatch.setattr(system.time, "sleep", lambda s: _REAL_SLEEP(0.005))
+
+
+def test_live_target_boots_holds_and_tears_down(tmp_path, monkeypatch):
+    proc = _FakeProc(b"Starting kernel\nmydev login:\n")
+    monkeypatch.setattr(system.subprocess, "Popen", lambda *a, **k: proc)
+    monkeypatch.setattr(system, "_probe_ports", lambda ports, **k: [23, 80])
+    killed = []
+    monkeypatch.setattr(system, "_kill_group", lambda p: killed.append(p))
+    _fast_sleep(monkeypatch)
+
+    target = system.LiveTarget(["qemu"], None, str(tmp_path), [23, 80, 22], SystemOptions(timeout_s=2.0, service_grace_s=0.0))
+    with target:
+        assert target.booted and "login:" in target.console
+        assert target.probe() == [23, 80]  # stays alive for probing
+        assert target.host_port(23) == system._host_port(23) == 45023
+    assert killed == [proc]  # leaving the context tore the guest down
+
+
+def test_live_target_launch_failure_is_recorded_not_raised(tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise OSError("no qemu")
+
+    monkeypatch.setattr(system.subprocess, "Popen", boom)
+    monkeypatch.setattr(system, "_probe_ports", lambda ports, **k: [])
+    monkeypatch.setattr(system, "_kill_group", lambda p: None)
+
+    with system.LiveTarget(["qemu"], None, str(tmp_path), [23], SystemOptions(timeout_s=1.0)) as target:
+        assert target.booted is False
+        assert "could not launch" in target.console
+        assert target.probe() == []
+
+
+def test_boot_wrapper_probes_once_via_live_target(tmp_path, monkeypatch):
+    proc = _FakeProc(b"mydev login:\n")
+    monkeypatch.setattr(system.subprocess, "Popen", lambda *a, **k: proc)
+    monkeypatch.setattr(system, "_probe_ports", lambda ports, **k: [80])
+    monkeypatch.setattr(system, "_kill_group", lambda p: None)
+    _fast_sleep(monkeypatch)
+
+    console, ports = system._boot(["qemu"], None, str(tmp_path), [80], SystemOptions(timeout_s=2.0, service_grace_s=0.0))
+    assert ports == [80] and "login:" in console
+
+
+def test_open_live_target_returns_unstarted_target(tmp_path, monkeypatch):
+    monkeypatch.setattr(system.sys, "platform", "linux")
+    monkeypatch.setattr(system, "detect_tier", lambda policy: ("bwrap", None))
+    monkeypatch.setattr(system, "find_qemu_system", lambda prog: "/usr/bin/" + prog)
+    monkeypatch.setattr(system, "find_kernel", lambda root: "/boot/vmlinux")
+    monkeypatch.setattr(system, "build_ext2_image", lambda rootfs, out, size_mb=256: None)
+
+    target, result = system.open_live_target(_extraction(tmp_path), _arm_inv(tmp_path), SystemOptions())
+    assert result.available and isinstance(target, system.LiveTarget)
+    assert target.guest_ports == sorted(system.COMMON_PORTS)
+
+
+def test_open_live_target_none_when_boot_impossible(tmp_path, monkeypatch):
+    monkeypatch.setattr(system.sys, "platform", "win32")
+    target, result = system.open_live_target(_extraction(tmp_path), _arm_inv(tmp_path), SystemOptions())
+    assert target is None and result.available is False and "Linux" in result.reason
