@@ -13,11 +13,20 @@ or unparseable output degrades to ``None`` rather than raising.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 from collections import deque
+
+# A normalized function signature hashes the sequence of instruction mnemonics
+# with all operands dropped (registers, immediates, memory offsets and call
+# targets), so it survives relocation and operand/immediate differences that
+# change the raw bytes. It does NOT survive instruction selection/scheduling
+# under a different optimization level — that needs structural matching.
+_NORM_HASH_HEX = 32
+_MIN_NORM_OPS = 8  # skip trivial functions whose mnemonic sequence is not distinctive
 
 # Imported symbols that mark a function as consuming externally-controlled input.
 # A vulnerable function reachable from one of these is reachable from an attacker.
@@ -138,3 +147,65 @@ def function_reachable(graph: dict[str, set[str]], function_names: set[str]) -> 
     entries = {n for n in graph if _basename(n) in ENTRY_NAMES or n in ENTRY_NAMES} - targets
     input_sources = {n for n, callees in graph.items() if any(_basename(c) in INPUT_SOURCE_SYMBOLS for c in callees)} - targets
     return reachable_from(graph, entries, targets), reachable_from(graph, input_sources, targets)
+
+
+def _iter_json_objects(text: str):
+    """Yield each top-level JSON object in ``text`` (radare2's ``pdfj @@f``
+    emits one object per function, concatenated). Stray non-JSON is skipped."""
+    dec = json.JSONDecoder()
+    i, n = 0, len(text)
+    while i < n:
+        while i < n and text[i] in " \t\r\n":
+            i += 1
+        if i >= n:
+            return
+        if text[i] != "{":
+            nxt = text.find("{", i)
+            if nxt < 0:
+                return
+            i = nxt
+        try:
+            obj, end = dec.raw_decode(text, i)
+        except json.JSONDecodeError:
+            nxt = text.find("{", i + 1)
+            if nxt < 0:
+                return
+            i = nxt
+            continue
+        yield obj
+        i = end
+
+
+def normalize_ops(ops: list) -> str | None:
+    """Operand-stripped signature of one function's instructions, or None when
+    it is too short to be distinctive. ``ops`` is a radare2 ``pdfj`` op list."""
+    mnemonics = [m for op in ops if isinstance(op, dict) and (m := (op.get("opcode") or "").split(" ", 1)[0])]
+    if len(mnemonics) < _MIN_NORM_OPS:
+        return None
+    return hashlib.sha256("\n".join(mnemonics).encode()).hexdigest()[:_NORM_HASH_HEX]
+
+
+def normalized_functions(binary: str, *, timeout: float = 180.0) -> dict[str, str] | None:
+    """``{function name: normalized signature}`` via radare2 disassembly.
+
+    None when radare2 is unavailable or analysis fails/times out. Heavy (full
+    analysis plus per-function disassembly), so this is only used to build/scan
+    normalized fingerprints when the caller opts in.
+    """
+    r2 = radare2_path()
+    if r2 is None:
+        return None
+    out = _run(r2, binary, "aaa;pdfj @@f", timeout)
+    if not out:
+        return None
+    sigs: dict[str, str] = {}
+    for obj in _iter_json_objects(out):
+        if not isinstance(obj, dict):
+            continue
+        name, ops = obj.get("name"), obj.get("ops")
+        if not name or not isinstance(ops, list):
+            continue
+        sig = normalize_ops(ops)
+        if sig is not None:
+            sigs[name] = sig
+    return sigs or None

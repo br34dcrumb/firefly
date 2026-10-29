@@ -7,6 +7,8 @@ logic is tested against a call graph shaped exactly like radare2's ``agCj``.
 
 from __future__ import annotations
 
+import json
+
 from firefly import disasm
 
 # A call graph in agCj shape (already parsed to {caller: {callees}}):
@@ -88,3 +90,46 @@ def test_radare2_path_env_override(monkeypatch, tmp_path):
     assert disasm.radare2_path() == str(exe)
     monkeypatch.setenv("FIREFLY_RADARE2", str(tmp_path / "missing"))
     assert disasm.radare2_path() is None
+
+
+# --------------------------------------------------------------------------- normalized fingerprints
+
+_MNE = ["mov", "add", "push", "mov", "call", "test", "je", "ret"]  # >= _MIN_NORM_OPS
+
+
+def _ops(mnemonics, operand="eax, 1"):
+    return [{"opcode": f"{m} {operand}"} for m in mnemonics]
+
+
+def test_normalize_ops_is_operand_invariant():
+    # same mnemonics, different operands/immediates/registers -> same signature
+    a = disasm.normalize_ops(_ops(_MNE, "eax, 1"))
+    b = disasm.normalize_ops(_ops(_MNE, "rbx, 0x4040"))
+    assert a is not None and a == b
+
+
+def test_normalize_ops_distinguishes_mnemonics():
+    assert disasm.normalize_ops(_ops(_MNE)) != disasm.normalize_ops(_ops(["xor"] + _MNE[1:]))
+
+
+def test_normalize_ops_skips_tiny_functions():
+    assert disasm.normalize_ops(_ops(["mov", "ret"])) is None  # fewer than _MIN_NORM_OPS
+
+
+def test_iter_json_objects_parses_concatenated_with_noise():
+    text = '  {"a":1}\nWARN stray line\n{"b":2}  '
+    assert list(disasm._iter_json_objects(text)) == [{"a": 1}, {"b": 2}]
+
+
+def test_normalized_functions_builds_map_and_skips_tiny(monkeypatch):
+    f1 = '{"name":"sym.inflate","addr":1,"ops":' + json.dumps(_ops(_MNE)) + "}"
+    f2 = '{"name":"sym.tiny","addr":2,"ops":' + json.dumps(_ops(["mov", "ret"])) + "}"
+    monkeypatch.setattr(disasm, "radare2_path", lambda: "radare2")
+    monkeypatch.setattr(disasm, "_run", lambda *a, **k: f1 + "\n" + f2)
+    sigs = disasm.normalized_functions("x.bin")
+    assert set(sigs) == {"sym.inflate"}  # the 2-op function is below the threshold
+
+
+def test_normalized_functions_degrades_without_radare2(monkeypatch):
+    monkeypatch.setattr(disasm, "radare2_path", lambda: None)
+    assert disasm.normalized_functions("x.bin") is None
