@@ -19,6 +19,7 @@ def report():
             {"analyzer": "cves", "title": "CVE-2016-2108 in openssl 1.0.2a", "severity": "critical", "confidence": "high", "path": "lib/libssl.so", "description": "ASN.1 bug.", "evidence": None, "id": "FF-aaa", "metadata": {"cve": "CVE-2016-2108", "cvss_score": 9.8, "kev": False, "component": {"vendor": "openssl", "product": "openssl", "version": "1.0.2a"}, "url": "https://nvd.nist.gov/vuln/detail/CVE-2016-2108", "line": None}},
             {"analyzer": "credentials", "title": "Private key in a.pem", "severity": "critical", "confidence": "high", "path": "etc/a.pem", "description": "Key.", "evidence": "-----BEGIN RSA PRIVATE KEY----- (100 base64 chars)", "id": "FF-bbb", "metadata": {"kind": "private_key", "line": 1}},
             {"analyzer": "accounts", "title": "root empty password", "severity": "high", "confidence": "high", "path": "etc/shadow", "description": "No password.", "evidence": None, "id": "FF-ccc", "metadata": {}},
+            {"analyzer": "crypto", "title": "No boot-integrity mechanism detected", "severity": "low", "confidence": "low", "path": None, "description": "Posture.", "evidence": None, "id": "FF-ddd", "metadata": {}},
         ],
         "artifacts": {},
         "errors": [],
@@ -33,9 +34,18 @@ def test_sarif_structure(report):
     assert doc["version"] == "2.1.0"
     run = doc["runs"][0]
     assert run["tool"]["driver"]["name"] == "Firefly"
-    assert len(run["results"]) == 3
+    assert len(run["results"]) == 4
     rule_ids = {r["id"] for r in run["tool"]["driver"]["rules"]}
     assert {"cves", "credentials", "accounts"} <= rule_ids
+
+
+def test_sarif_every_result_has_a_location(report):
+    # GitHub code scanning rejects the whole upload if any result lacks a
+    # location, so a path-less finding must fall back to the firmware image.
+    results = sarif.build(report)["runs"][0]["results"]
+    assert all(r["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] for r in results)
+    posture = next(r for r in results if r["ruleId"] == "crypto")
+    assert posture["locations"][0]["physicalLocation"]["artifactLocation"]["uri"] == "router.bin"
 
 
 def test_sarif_levels_and_severity(report):
@@ -79,7 +89,7 @@ def test_html_embeds_data_safely(report):
     # data is parseable: extract and load it
     raw = html.split('type="application/json">', 1)[1].split("</script>", 1)[0].replace("<\\/", "</")
     data = json.loads(raw)
-    assert len(data["findings"]) == 3
+    assert len(data["findings"]) == 4
 
 
 def test_html_contains_no_unredacted_secret(report):

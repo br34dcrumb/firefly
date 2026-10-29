@@ -39,7 +39,7 @@ def _rules() -> list[dict[str, Any]]:
     return rules
 
 
-def _result(finding: dict[str, Any]) -> dict[str, Any]:
+def _result(finding: dict[str, Any], image_uri: str) -> dict[str, Any]:
     severity = finding["severity"]
     md = finding.get("metadata", {})
     score = md.get("cvss_score")
@@ -57,6 +57,9 @@ def _result(finding: dict[str, Any]) -> dict[str, Any]:
         # Stable across runs: lets code scanning track/dedupe the same finding.
         "partialFingerprints": {"fireflyFindingId/v1": finding.get("id", "")},
     }
+    # Every result must carry at least one location or GitHub code scanning
+    # rejects the whole upload. A path-less finding is about the image as a
+    # whole (e.g. a posture check), so anchor it to the firmware image itself.
     if finding.get("path"):
         region = {}
         if isinstance(md.get("line"), int):
@@ -64,7 +67,9 @@ def _result(finding: dict[str, Any]) -> dict[str, Any]:
         location = {"physicalLocation": {"artifactLocation": {"uri": finding["path"]}}}
         if region:
             location["physicalLocation"]["region"] = region
-        result["locations"] = [location]
+    else:
+        location = {"physicalLocation": {"artifactLocation": {"uri": image_uri}}}
+    result["locations"] = [location]
     for key in ("cve", "cwe", "url"):
         if md.get(key):
             result["properties"][key] = md[key]
@@ -81,8 +86,10 @@ def _message(finding: dict[str, Any]) -> str:
 
 
 def build(report: dict[str, Any]) -> dict[str, Any]:
-    results = [_result(f) for f in report.get("findings", [])]
     inp = report.get("input", {})
+    # Fallback location for whole-image findings: the firmware image's name.
+    image_uri = os.path.basename((inp.get("path") or "").rstrip("/\\")) or "firmware"
+    results = [_result(f, image_uri) for f in report.get("findings", [])]
     return {
         "$schema": SCHEMA,
         "version": "2.1.0",
