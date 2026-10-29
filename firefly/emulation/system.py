@@ -251,6 +251,16 @@ def _host_port(guest_port: int) -> int:
     return _HOST_PORT_BASE + guest_port
 
 
+def reliable_open_ports(open_ports: list[int], guest_ports: list[int]) -> list[int]:
+    """Drop a wall of false positives: if *every* forwarded port looks open the
+    guest never became reachable (slirp accepts the host side but has no guest to
+    connect to, so each probe just times out). A real device does not listen on
+    all of these, so treat that as "no services reliably detected". Shared by the
+    one-shot boot and the live (Phase C) path so the two never disagree.
+    """
+    return [] if len(open_ports) >= len(guest_ports) else open_ports
+
+
 def _probe_ports(guest_ports: list[int], connect_timeout: float = 2.0, read_timeout: float = 1.0) -> list[int]:
     """Return guest ports that are actually listening on the booted device.
 
@@ -393,13 +403,7 @@ def run_system(extraction: ExtractionResult, inv: Inventory, options: SystemOpti
 
     console, open_ports = _boot(plan.argv, plan.preexec, plan.scan_root, plan.guest_ports, options)
     result.console_tail = console
-    # If *every* forwarded port looks open, the guest never became reachable
-    # (slirp accepts the host side but has no guest to connect to, so each probe
-    # just times out). A real device does not listen on all of these, so treat
-    # this as "no services reliably detected" rather than a wall of false hits.
-    if len(open_ports) >= len(plan.guest_ports):
-        open_ports = []
-    result.open_ports = open_ports
+    result.open_ports = reliable_open_ports(open_ports, plan.guest_ports)
     result.booted, result.boot_reason = classify_console(console)
     # Services answering is itself strong evidence the device is up.
     if open_ports and not result.booted:

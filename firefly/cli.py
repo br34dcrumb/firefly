@@ -37,6 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--sarif", action="store_true", help="also write a SARIF file for CI (e.g. GitHub code scanning)")
     scan.add_argument("--emulate", action="store_true", help="also run binaries under qemu-user (Linux only; executes untrusted code in a sandbox)")
     scan.add_argument("--emulate-system", action="store_true", help="also attempt a full-system boot under qemu-system (Linux only)")
+    scan.add_argument("--dynamic", action="store_true", help="dynamic testing on the live device: boot it (implies --emulate-system) and crawl its HTTP surface (Linux only)")
     _add_emulation_args(scan)
     _add_system_args(scan)
     scan.add_argument(
@@ -217,6 +218,7 @@ def _scan_command(args: argparse.Namespace) -> int:
         emulate_append=args.system_append,
         emulate_image=args.system_image,
         emulate_initrd=args.system_initrd,
+        dynamic=args.dynamic,
     )
     result = scan(args.input, options)
     report_path = write_json(result)

@@ -59,6 +59,8 @@ class ScanOptions:
     emulate_append: str | None = None
     emulate_image: str | None = None
     emulate_initrd: str | None = None
+    # Phase C: dynamic testing on the live device (implies full-system boot)
+    dynamic: bool = False  # C1 live surface crawl of the booted device's HTTP services
 
 
 @dataclass
@@ -172,7 +174,9 @@ def scan(path: str, options: ScanOptions | None = None) -> ScanResult:
     if options.emulate and ctx.inventory is not None and ctx.extraction is not None:
         _run_emulation(result, ctx, options)
 
-    if options.emulate_system and ctx.inventory is not None and ctx.extraction is not None:
+    if options.dynamic and ctx.inventory is not None and ctx.extraction is not None:
+        _run_dynamic(result, ctx, options)
+    elif options.emulate_system and ctx.inventory is not None and ctx.extraction is not None:
         _run_system_emulation(result, ctx, options)
 
     result.findings.sort(key=lambda f: (-f.severity.rank, not f.metadata.get("kev"), -(f.metadata.get("cvss_score") or 0), f.analyzer, f.title))
@@ -245,6 +249,69 @@ def _run_system_emulation(result: ScanResult, ctx: ScanContext, options: ScanOpt
         result.errors.append({"stage": "system_emulation", "error": f"{type(exc).__name__}: {exc}", "traceback": traceback.format_exc()})
     finally:
         result.timings["system_emulation"] = round(time.perf_counter() - t0, 3)
+
+
+def _run_dynamic(result: ScanResult, ctx: ScanContext, options: ScanOptions) -> None:
+    """Phase C dynamic testing: boot the device, hold it open, and crawl its
+    live HTTP surface (C1). Implies the full-system boot; its boot result is
+    reported exactly as ``--emulate-system`` would, plus a ``surface`` artifact.
+
+    Isolated in its own try/except so a dynamic-stage failure never costs the
+    static results, and it degrades gracefully: no boot -> the boot result's
+    reason is reported and no crawl runs.
+    """
+    t0 = time.perf_counter()
+    try:
+        from firefly.emulation.system import (
+            COMMON_PORTS,
+            SystemOptions,
+            open_live_target,
+            reliable_open_ports,
+        )
+        from firefly.emulation.crawl import crawl_surface
+
+        assert ctx.extraction is not None and ctx.inventory is not None
+        sys_opts = SystemOptions(
+            timeout_s=options.emulate_system_timeout,
+            require_sandbox=options.emulate_sandbox,
+            kernel=options.emulate_kernel,
+            machine=options.emulate_machine,
+            dtb=options.emulate_dtb,
+            nic=options.emulate_nic,
+            append=options.emulate_append,
+            image=options.emulate_image,
+            initrd=options.emulate_initrd,
+            workdir=ctx.workdir,
+        )
+        target, res = open_live_target(ctx.extraction, ctx.inventory, sys_opts)
+        if target is None:
+            result.findings.extend(res.to_findings())
+            result.artifacts["system_emulation"] = res.to_artifact()
+            if res.reason:
+                result.warnings.append(f"dynamic testing skipped: {res.reason}")
+            return
+
+        with target:
+            target.probe()
+            res.console_tail = target.console
+            res.open_ports = reliable_open_ports(target.open_ports, target.guest_ports)
+            res.booted, res.boot_reason = target.booted, target.boot_reason
+            if res.open_ports and not res.booted:
+                res.booted, res.boot_reason = True, "services responded on forwarded ports"
+            # Crawl while the guest is still alive.
+            surface = crawl_surface(target, res.open_ports, COMMON_PORTS)
+
+        result.findings.extend(res.to_findings())
+        result.artifacts["system_emulation"] = res.to_artifact()
+        result.findings.extend(surface.to_findings())
+        result.artifacts["surface"] = surface.to_artifact()
+        if not res.booted:
+            result.warnings.append(f"dynamic testing: {res.boot_reason}")
+    except Exception as exc:  # dynamic failure must not lose the scan
+        log.debug("dynamic stage failed", exc_info=True)
+        result.errors.append({"stage": "dynamic", "error": f"{type(exc).__name__}: {exc}", "traceback": traceback.format_exc()})
+    finally:
+        result.timings["dynamic"] = round(time.perf_counter() - t0, 3)
 
 
 def _now() -> str:
