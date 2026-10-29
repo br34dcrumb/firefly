@@ -60,7 +60,8 @@ class ScanOptions:
     emulate_image: str | None = None
     emulate_initrd: str | None = None
     # Phase C: dynamic testing on the live device (implies full-system boot)
-    dynamic: bool = False  # C1 live surface crawl of the booted device's HTTP services
+    dynamic: bool = False  # C1 surface crawl + C2 auth confirmation on the booted device
+    fuzz: bool = False  # C3 mutational network fuzzer against the booted device's ports
 
 
 @dataclass
@@ -174,7 +175,7 @@ def scan(path: str, options: ScanOptions | None = None) -> ScanResult:
     if options.emulate and ctx.inventory is not None and ctx.extraction is not None:
         _run_emulation(result, ctx, options)
 
-    if options.dynamic and ctx.inventory is not None and ctx.extraction is not None:
+    if (options.dynamic or options.fuzz) and ctx.inventory is not None and ctx.extraction is not None:
         _run_dynamic(result, ctx, options)
     elif options.emulate_system and ctx.inventory is not None and ctx.extraction is not None:
         _run_system_emulation(result, ctx, options)
@@ -252,13 +253,14 @@ def _run_system_emulation(result: ScanResult, ctx: ScanContext, options: ScanOpt
 
 
 def _run_dynamic(result: ScanResult, ctx: ScanContext, options: ScanOptions) -> None:
-    """Phase C dynamic testing: boot the device, hold it open, and crawl its
-    live HTTP surface (C1). Implies the full-system boot; its boot result is
-    reported exactly as ``--emulate-system`` would, plus a ``surface`` artifact.
+    """Phase C dynamic testing on a single booted guest: surface crawl + auth
+    confirmation (C1/C2, ``--dynamic``) and/or the mutational network fuzzer
+    (C3, ``--fuzz``). Implies the full-system boot; the boot result is reported
+    exactly as ``--emulate-system`` would, plus the per-stage artifacts.
 
     Isolated in its own try/except so a dynamic-stage failure never costs the
     static results, and it degrades gracefully: no boot -> the boot result's
-    reason is reported and no crawl runs.
+    reason is reported and no stage runs.
     """
     t0 = time.perf_counter()
     try:
@@ -270,6 +272,7 @@ def _run_dynamic(result: ScanResult, ctx: ScanContext, options: ScanOptions) -> 
         )
         from firefly.emulation.crawl import crawl_surface
         from firefly.emulation.auth import AuthOptions, run_auth, upgrade_static_findings
+        from firefly.emulation.fuzz import FuzzOptions, run_fuzz
 
         assert ctx.extraction is not None and ctx.inventory is not None
         sys_opts = SystemOptions(
@@ -292,6 +295,7 @@ def _run_dynamic(result: ScanResult, ctx: ScanContext, options: ScanOptions) -> 
                 result.warnings.append(f"dynamic testing skipped: {res.reason}")
             return
 
+        surface = auth = fuzz = None
         with target:
             target.probe()
             res.console_tail = target.console
@@ -299,18 +303,28 @@ def _run_dynamic(result: ScanResult, ctx: ScanContext, options: ScanOptions) -> 
             res.booted, res.boot_reason = target.booted, target.boot_reason
             if res.open_ports and not res.booted:
                 res.booted, res.boot_reason = True, "services responded on forwarded ports"
-            # Crawl the surface and confirm credentials while the guest is alive.
-            surface = crawl_surface(target, res.open_ports, COMMON_PORTS)
-            auth = run_auth(target, res.open_ports, COMMON_PORTS, result.findings, AuthOptions())
+            # All stages share this one live guest. C1/C2 first (they only read
+            # the services); the fuzzer runs last because it tries to crash them.
+            if options.dynamic:
+                surface = crawl_surface(target, res.open_ports, COMMON_PORTS)
+                auth = run_auth(target, res.open_ports, COMMON_PORTS, result.findings, AuthOptions())
+            if options.fuzz:
+                fuzz = run_fuzz(target, res.open_ports, COMMON_PORTS, FuzzOptions())
+            res.console_tail = target.console  # refresh after the stages (fuzz may add crash output)
 
         result.findings.extend(res.to_findings())
         result.artifacts["system_emulation"] = res.to_artifact()
-        result.findings.extend(surface.to_findings())
-        result.artifacts["surface"] = surface.to_artifact()
-        result.findings.extend(auth.to_findings())
-        result.artifacts["auth"] = auth.to_artifact()
-        # Positive signal: a confirmed login upgrades the related static finding.
-        upgrade_static_findings(result.findings, auth.confirmations)
+        if surface is not None:
+            result.findings.extend(surface.to_findings())
+            result.artifacts["surface"] = surface.to_artifact()
+        if auth is not None:
+            result.findings.extend(auth.to_findings())
+            result.artifacts["auth"] = auth.to_artifact()
+            # Positive signal: a confirmed login upgrades the related static finding.
+            upgrade_static_findings(result.findings, auth.confirmations)
+        if fuzz is not None:
+            result.findings.extend(fuzz.to_findings())
+            result.artifacts["fuzz"] = fuzz.to_artifact()
         if not res.booted:
             result.warnings.append(f"dynamic testing: {res.boot_reason}")
     except Exception as exc:  # dynamic failure must not lose the scan
