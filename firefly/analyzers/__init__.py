@@ -29,8 +29,10 @@ class ScanContext:
     inventory: Inventory | None = None
     db_path: str | None = None
     fpdb_path: str | None = None
-    # Opt-in: confirm CVE reachability with radare2's call graph (heavier).
+    # Opt-in radare2-backed deep analysis (heavier): call-graph reachability
+    # for CVEs, and normalized function matching for fingerprinting.
     deep_reachability: bool = False
+    deep_fingerprint: bool = False
     # Components found by analyzers that already ran (analyzers run in order).
     components: list[Component] = field(default_factory=list)
 

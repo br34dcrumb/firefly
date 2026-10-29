@@ -168,6 +168,45 @@ def test_fpdb_respects_arch_and_thresholds(tmp_path):
     db.close()
 
 
+def test_fpdb_normalized_matching_is_a_separate_signal(tmp_path):
+    db = FpDB(str(tmp_path / "fp.sqlite"))
+    exact = [f"{i:032x}" for i in range(10)]
+    norm = [f"n{i:031x}" for i in range(10)]
+    db.add(hashes=exact, arch="arm", vendor="zlib", product="zlib", version="1.2.11")
+    db.add_normalized(norm_hashes=norm, arch="arm", vendor="zlib", product="zlib", version="1.2.11")
+    # exact path unchanged when norm_hashes is omitted
+    assert db.identify(set(exact[:8]), "arm")[0].matched == 8
+    # a binary whose exact hashes don't overlap but whose normalized ones do
+    found = db.identify({"dead" * 8}, "arm", norm_hashes=set(norm[:7]))
+    assert len(found) == 1
+    ident = found[0]
+    assert ident.matched == 0 and ident.normalized_matched == 7 and ident.normalized_total == 10
+    assert round(ident.normalized_ratio, 2) == 0.7
+    db.close()
+
+
+def test_fpdb_ignores_normalized_rows_when_not_requested(tmp_path):
+    # Backward compatibility: normalized rows present, but an exact-only query
+    # (norm_hashes=None) behaves exactly as a v1 database would.
+    db = FpDB(str(tmp_path / "fp.sqlite"))
+    db.add_normalized(norm_hashes=[f"n{i:031x}" for i in range(10)], arch="arm", vendor=None, product="zlib", version="1.2.11")
+    assert db.identify({f"{i:032x}" for i in range(10)}, "arm") == []
+    assert db.info()["schema"] == "2" and db.info()["normalized"] == "10"
+    db.close()
+
+
+def test_build_from_manifest_stores_normalized(tmp_path, monkeypatch):
+    (tmp_path / "libfoo.so").write_bytes(_elf_with_function("deflate", bytes(range(32))))
+    monkeypatch.setattr("firefly.fpdb.disasm.normalized_functions", lambda path, **k: {"deflate": "n" * 32, "crc32": "m" * 32})
+    manifest = tmp_path / "m.json"
+    manifest.write_text(json.dumps([{"path": "libfoo.so", "product": "foo", "version": "1.0", "arch": "arm"}]))
+    info = build_from_manifest(str(tmp_path / "fp.sqlite"), str(manifest))
+    assert info["normalized"] == "2"
+    db = FpDB(str(tmp_path / "fp.sqlite"))
+    assert [i.product for i in db.identify(set(), "arm", norm_hashes={"n" * 32, "m" * 32}, min_matched=1)] == ["foo"]
+    db.close()
+
+
 # --------------------------------------------------------------------------- analyzer
 
 
@@ -217,6 +256,28 @@ def test_analyzer_keeps_one_version_per_product(tmp_path, monkeypatch):
 
     res = FingerprintAnalyzer().run(_ctx(tmp_path, str(dbfile)))
     assert [(c.product, c.version) for c in res.components] == [("zlib", "1.2.11")]
+
+
+def test_analyzer_deep_fingerprint_matches_normalized(tmp_path, monkeypatch):
+    # With --deep-fingerprint, a binary whose exact hashes don't match but whose
+    # radare2-normalized ones do is still identified (via the normalized signal).
+    dbfile = tmp_path / "fp.sqlite"
+    db = FpDB(str(dbfile))
+    norm = [f"n{i:031x}" for i in range(10)]
+    db.add_normalized(norm_hashes=norm, arch="arm", vendor="zlib", product="zlib", version="1.2.11")
+    db.close()
+
+    monkeypatch.setattr(
+        analyzer_mod, "extract_functions_file",
+        lambda path: [FunctionSig(name=f"f{i}", size=32, hash=f"{i:032x}") for i in range(10)],  # no exact overlap
+    )
+    monkeypatch.setattr("firefly.disasm.normalized_functions", lambda path, **k: {f"g{i}": norm[i] for i in range(8)})
+
+    ctx = _ctx(tmp_path, str(dbfile))
+    ctx.deep_fingerprint = True
+    res = FingerprintAnalyzer().run(ctx)
+    assert [(c.product, c.version) for c in res.components] == [("zlib", "1.2.11")]
+    assert "normalized fingerprint" in res.components[0].evidence[0]
 
 
 def test_analyzer_without_db_warns(tmp_path):

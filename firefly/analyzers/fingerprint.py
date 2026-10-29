@@ -9,6 +9,7 @@ informational finding (so it is visible even when no CVE applies).
 
 from __future__ import annotations
 
+from firefly import disasm
 from firefly.analyzers import Analyzer, AnalyzerResult, ScanContext
 from firefly.components import merge
 from firefly.fingerprint import extract_functions_file
@@ -35,27 +36,38 @@ class FingerprintAnalyzer(Analyzer):
             for rec in ctx.inventory.of_kind(FileKind.ELF):
                 if not (rec.is_executable_code and rec.elf):
                     continue
-                sigs = extract_functions_file(ctx.inventory.abspath(rec))
+                abspath = ctx.inventory.abspath(rec)
+                sigs = extract_functions_file(abspath)
                 if not sigs:
                     continue
                 scanned += 1
                 hashes = {s.hash for s in sigs}
+                # Opt-in: also match radare2-normalized signatures, which survive
+                # relocation and operand differences the exact hash does not.
+                norm_hashes = None
+                if ctx.deep_fingerprint:
+                    nf = disasm.normalized_functions(abspath)
+                    norm_hashes = set(nf.values()) if nf else None
                 # identify() returns every reference build over threshold, best
                 # first; close versions of one product share most functions, so
                 # keep only the strongest version per product to avoid emitting
                 # a component (and CVEs) for a version that isn't present.
                 seen: set[tuple[str | None, str]] = set()
-                for ident in db.identify(hashes, rec.elf.machine):
+                for ident in db.identify(hashes, rec.elf.machine, norm_hashes=norm_hashes):
                     if (ident.vendor, ident.product) in seen:
                         continue
                     seen.add((ident.vendor, ident.product))
+                    if ident.matched:
+                        evidence = f"{ident.matched}/{ident.reference_total} functions match {ident.product} {ident.version} by exact code fingerprint"
+                    else:
+                        evidence = f"{ident.normalized_matched}/{ident.normalized_total} functions match {ident.product} {ident.version} by normalized fingerprint (radare2)"
                     raw.append(
                         Component(
                             product=ident.product,
                             version=ident.version,
                             vendor=ident.vendor,
                             paths=[rec.path],
-                            evidence=[f"{ident.matched}/{ident.reference_total} functions match {ident.product} {ident.version} by code fingerprint"],
+                            evidence=[evidence],
                         )
                     )
 
