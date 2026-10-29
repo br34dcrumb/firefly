@@ -125,6 +125,10 @@ def run_emulation(rootfs: str, inv: Inventory, options: EmulationOptions) -> Emu
     # Emulation is I/O-bound (each run waits on a subprocess), so threads give
     # real concurrency here. map() keeps the results in candidate order.
     workers = max(1, min(options.jobs, len(tasks))) if tasks else 1
+    # The rlimit-only tier sets a preexec_fn, which CPython documents as prone to
+    # deadlock when combined with threads; run those launches serially.
+    if tier == "rlimit-only":
+        workers = 1
     if workers > 1:
         with ThreadPoolExecutor(max_workers=workers) as pool:
             result.runs = list(pool.map(run_one, enumerate(tasks)))

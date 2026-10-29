@@ -347,6 +347,9 @@ def import_files(db: VulnDB, paths: Iterable[str], fresh: bool = False) -> int:
             n = db.upsert(iter_feed_records(fh), fresh=fresh)
         log.info("imported %d records from %s", n, path)
         total += n
+    # Record the current schema so a later scan doesn't mistake an air-gapped
+    # import for an out-of-date database and warn to rebuild it.
+    db.set_meta("schema", str(SCHEMA_VERSION))
     db.set_meta("updated_at", _now())
     db.conn.commit()
     return total

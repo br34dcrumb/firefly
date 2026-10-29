@@ -12,8 +12,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 from firefly.analyzers import Analyzer, ScanContext, all_analyzers
+from firefly.elf import parse_file
 from firefly.extract import ExtractionError, extract
-from firefly.inventory import Inventory
+from firefly.inventory import Inventory, file_strings
 from firefly.models import Component, Finding
 
 log = logging.getLogger(__name__)
@@ -105,6 +106,12 @@ def scan(path: str, options: ScanOptions | None = None) -> ScanResult:
     name = os.path.basename(path.rstrip("/\\")) or "input"
     workdir = os.path.abspath(os.path.join(options.output_dir, f"{name}_{digest[:12]}"))
     os.makedirs(workdir, exist_ok=True)
+
+    # These module caches are keyed by (path, size); clear them per scan so a
+    # second scan of a path whose content changed but kept its size in the same
+    # process (library/server reuse) never returns a stale parse.
+    parse_file.cache_clear()
+    file_strings.cache_clear()
 
     result = ScanResult(path, digest, size, workdir, started=_now())
     ctx = ScanContext(firmware_path=path, workdir=workdir, jobs=max(1, options.jobs), db_path=options.db_path, fpdb_path=options.fpdb_path)

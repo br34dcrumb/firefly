@@ -172,6 +172,15 @@ def test_file_diff_size_fallback_for_unhashable():
     assert changed[0]["old_size"] == 600_000_000 and changed[0]["new_size"] == 800_000_000
 
 
+def test_file_diff_size_fallback_when_one_side_unhashable():
+    # A file hashed in the old build but over HASH_LIMIT (no hash) in the new
+    # build, same kind, with a differing size is still a provable change.
+    old = _report(files=[_file("blob.bin", "abc123", size=100)])
+    new = _report(files=[_file("blob.bin", None, size=600_000_000)])
+    changed = diff_reports(old, new).files.changed
+    assert [f["path"] for f in changed] == ["blob.bin"]
+
+
 def test_file_diff_unavailable_when_inventory_missing():
     # Old-schema report (no "files" key) -> file diff degrades to None.
     old = _report(components=[_comp("zlib", "1.0")])            # no files key

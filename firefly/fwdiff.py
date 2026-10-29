@@ -298,10 +298,11 @@ def _diff_files(old_files: list[dict], new_files: list[dict]) -> FileDiff:
         kind_changed = o.get("kind") != n.get("kind")
         oc, nc = _content_id(o), _content_id(n)
         content_changed = oc is not None and nc is not None and oc != nc
-        # When content can't be hashed on either side (e.g. a file over
-        # inventory's HASH_LIMIT), a differing size still proves a change; use
-        # it as a fallback so large blobs aren't silently skipped.
-        size_changed = oc is None and nc is None and not kind_changed and o.get("size") != n.get("size")
+        # When content can't be compared on at least one side (e.g. a file that
+        # crossed inventory's HASH_LIMIT between builds, so it's hashed on one
+        # side and not the other), a differing size still proves a change; use it
+        # as a fallback so large blobs aren't silently skipped.
+        size_changed = (oc is None or nc is None) and not kind_changed and o.get("size") != n.get("size")
         if kind_changed or content_changed or size_changed:
             diff.changed.append({
                 "path": path,

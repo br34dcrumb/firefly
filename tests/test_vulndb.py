@@ -5,7 +5,7 @@ import json
 import pytest
 
 from firefly import vulndb
-from firefly.vulndb import VulnDB, download_verified, import_files, iter_feed_records
+from firefly.vulndb import SCHEMA_VERSION, VulnDB, download_verified, import_files, iter_feed_records
 
 from nvdfeed import SAMPLE_RECORDS, cve, match, write_feed
 
@@ -24,6 +24,8 @@ def test_import_and_query(tmp_path):
         assert import_files(db, [str(feed)]) == 5  # rejected record skipped
         info = db.info()
         assert info["cves"] == 5 and info["known_exploited"] == 1
+        # import records the current schema, so a later scan doesn't warn to rebuild
+        assert info["schema"] == str(SCHEMA_VERSION)
         rows = db.candidates("openssl", "openssl")
         assert {r["cve_id"] for r in rows} == {"CVE-2021-3711", "CVE-2014-0160"}
         heartbleed = next(r for r in rows if r["cve_id"] == "CVE-2014-0160")

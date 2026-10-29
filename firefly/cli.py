@@ -283,7 +283,6 @@ def _disclose_command(args: argparse.Namespace) -> int:
     disclosure.save_tracker(tracker, tracker_path)
 
     target = os.path.basename(report.get("input", {}).get("path", "firmware"))
-    discovered = tracker["updated"]
     for item in items:
         entry = tracker["items"][item.id]
         md = advisory.render_advisory(
@@ -297,7 +296,7 @@ def _disclose_command(args: argparse.Namespace) -> int:
         with open(os.path.join(adv_dir, f"{item.id}.md"), "w", encoding="utf-8") as fh:
             fh.write(md)
 
-    index = advisory.render_index(items, target=target, discovered=discovered, researcher=args.researcher)
+    index = advisory.render_index(items, target=target, researcher=args.researcher)
     with open(os.path.join(out_dir, "README.md"), "w", encoding="utf-8") as fh:
         fh.write(index)
 

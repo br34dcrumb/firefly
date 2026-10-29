@@ -10,7 +10,7 @@ is parsed locally; otherwise the advisory explains where to look.
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import datetime, timezone
 
 from firefly.disclosure import DisclosureItem
 
@@ -106,7 +106,7 @@ def render_advisory(item: DisclosureItem, *, researcher: str, vendor: str | None
 """
 
 
-def render_index(items: list[DisclosureItem], *, target: str, discovered: str, researcher: str) -> str:
+def render_index(items: list[DisclosureItem], *, target: str, researcher: str) -> str:
     rows = "\n".join(
         f"| {i.id} | {i.severity} | {i.category} | {i.title} |" for i in items
     )
@@ -116,7 +116,7 @@ def render_index(items: list[DisclosureItem], *, target: str, discovered: str, r
     tally = ", ".join(f"{n} {sev}" for sev, n in sorted(counts.items(), key=lambda kv: -_rank(kv[0])))
     return f"""# Disclosure package: {target}
 
-Prepared {date.today().isoformat()} by {researcher} using Firefly.
+Prepared {datetime.now(timezone.utc).date().isoformat()} by {researcher} using Firefly.
 **{len(items)} item(s)** — {tally or "none"}.
 
 These are drafts. Review each advisory, confirm the vendor contact, and send
