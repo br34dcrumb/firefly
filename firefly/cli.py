@@ -106,8 +106,9 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument("--json", action="store_true", help="print results as JSON instead of a table")
     watch.add_argument("--fail-on-new", action="store_true", help="exit non-zero if any new CVE is found (for cron/CI)")
 
-    comply = sub.add_parser("comply", help="map a scan report's findings to the OWASP IoT Top 10 (indicative, not an attestation)")
+    comply = sub.add_parser("comply", help="map a scan report's findings to a compliance framework (indicative, not an attestation)")
     comply.add_argument("report", help="path to a firefly.json scan report (or a directory containing one)")
+    comply.add_argument("--framework", choices=["owasp", "cra", "iec62443"], default="owasp", help="framework to map to: OWASP IoT Top 10, EU CRA Annex I, or IEC 62443-4-2 (default: %(default)s)")
     comply.add_argument("-o", "--output", metavar="PATH", help="also write the coverage as JSON to this path")
     comply.add_argument("--json", action="store_true", help="print the coverage as JSON instead of a table")
     comply.add_argument("--min-confidence", choices=["low", "medium", "high"], default="medium", help="lowest finding confidence to include (default: %(default)s)")
@@ -395,7 +396,7 @@ def _comply_command(args: argparse.Namespace) -> int:
     except fwdiff.DiffError as exc:
         print(f"firefly: {exc}", file=sys.stderr)
         return 2
-    coverage = compliance.map_report(report, min_confidence=args.min_confidence)
+    coverage = compliance.map_report(report, min_confidence=args.min_confidence, framework=args.framework)
     if args.output:
         with open(args.output, "w", encoding="utf-8") as fh:
             json.dump(coverage, fh, indent=2)

@@ -1,8 +1,10 @@
-"""Tests for OWASP IoT Top 10 mapping (firefly comply)."""
+"""Tests for compliance-framework mapping (firefly comply)."""
 
 from __future__ import annotations
 
 import json
+
+import pytest
 
 from firefly import compliance
 from firefly.cli import main
@@ -65,4 +67,56 @@ def test_cli_json_and_file(tmp_path, capsys):
     assert rc == 0
     doc = json.loads(capsys.readouterr().out)
     assert doc["standard"] == "OWASP IoT Top 10 (2018)"
+    assert doc["framework"] == "owasp"
     assert json.loads(out.read_text())["categories"][0]["id"] == "I1"
+
+
+# --------------------------------------------------------------------------- CRA
+
+
+def test_cra_mapping():
+    m = lambda f: compliance.map_report(_report([f]), framework="cra")["categories"][0]["id"]  # noqa: E731
+    assert m(FINDINGS[0]) == "access-control"      # credentials
+    assert m(FINDINGS[1]) == "access-control"      # accounts
+    assert m(FINDINGS[2]) == "attack-surface"      # services
+    assert m(FINDINGS[3]) == "no-known-vuln"       # cves
+    assert m(FINDINGS[4]) == "confidentiality"     # crypto primitive
+    assert m(FINDINGS[5]) == "secure-updates"      # crypto secure-boot
+    assert m(FINDINGS[6]) == "exploit-mitigation"  # hardening has a home in CRA
+
+
+def test_cra_report_shape():
+    cov = compliance.map_report(_report(FINDINGS), framework="cra")
+    assert cov["framework"] == "cra" and cov["standard"].startswith("EU Cyber Resilience Act")
+    assert cov["unmapped"] == 0  # every sample finding maps under CRA
+    # categories keep the framework's own (insertion) order
+    ids = [c["id"] for c in cov["categories"]]
+    assert ids == [cid for cid in compliance.CRA if cid in ids]
+
+
+# --------------------------------------------------------------------------- IEC 62443
+
+
+def test_iec62443_mapping():
+    m = lambda f: compliance.map_report(_report([f]), framework="iec62443")["categories"][0]["id"]  # noqa: E731
+    assert m(FINDINGS[1]) == "FR1"  # accounts -> identification & auth
+    assert m(FINDINGS[2]) == "FR5"  # services -> restricted data flow
+    assert m(FINDINGS[3]) == "FR3"  # cves -> system integrity
+    assert m(FINDINGS[4]) == "FR4"  # crypto primitive -> data confidentiality
+    assert m(FINDINGS[5]) == "FR3"  # crypto secure-boot -> system integrity
+    assert m(FINDINGS[6]) == "FR3"  # hardening -> system integrity
+
+
+def test_unknown_framework_rejected():
+    with pytest.raises(ValueError):
+        compliance.map_report(_report(FINDINGS), framework="nope")
+
+
+def test_cli_framework_flag(tmp_path, capsys):
+    rpt = tmp_path / "firefly.json"
+    rpt.write_text(json.dumps(_report(FINDINGS)), encoding="utf-8")
+    rc = main(["comply", str(rpt), "--framework", "iec62443", "--json"])
+    assert rc == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["framework"] == "iec62443"
+    assert any(c["id"] == "FR3" for c in doc["categories"])
