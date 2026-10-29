@@ -10,7 +10,8 @@ from dataclasses import dataclass, field
 from firefly.analyzers import Analyzer, AnalyzerResult, ScanContext
 from firefly.cvecheck import Range, description_agrees, fixed_in_branch, platform_only
 from firefly.models import Component, Finding, Severity
-from firefly.reachability import classify, component_symbols, load_cve_functions
+from firefly.disasm import function_reachable
+from firefly.reachability import classify, component_call_graph, component_symbols, load_cve_functions
 from firefly.vercmp import compare, in_range
 from firefly.vulndb import SCHEMA_VERSION, VulnDB
 
@@ -107,12 +108,14 @@ class CveAnalyzer(Analyzer):
                 result.warnings.append("vulnerability database uses an older schema; run `firefly db update` to rebuild it")
             result.artifacts["database"] = {k: info[k] for k in ("release", "updated_at", "cves")}
             cve_functions = load_cve_functions()
-            reach_counts = {"reachable": 0, "not_present": 0}
+            reach_counts = {"reachable": 0, "not_present": 0, "reachable_network_facing": 0}
             for comp in ctx.components:
                 # Symbols are gathered once per component, lazily, and only for
                 # products we actually have reachability data for.
                 has_reach_data = ctx.inventory is not None and comp.product.lower() in cve_functions
-                comp_syms: tuple[set[str], bool] | None = None
+                comp_syms: tuple[set[str], bool, bool] | None = None
+                comp_graph: dict[str, set[str]] | None = None
+                graph_done = False
                 for cve, m in sorted(match_component(db, comp).items()):
                     row = m.row
                     kev = row["kev_added"] is not None
@@ -124,10 +127,10 @@ class CveAnalyzer(Analyzer):
                     if has_reach_data:
                         if comp_syms is None:
                             comp_syms = component_symbols(comp.paths, ctx.inventory)
-                        observed, known = comp_syms
+                        observed, known, exposed = comp_syms
                         reach = classify(cve, comp.product, observed, known, cve_functions)
                         if reach.status != "unknown":
-                            reachability = {"status": reach.status, "functions": reach.functions, "present": reach.present}
+                            reachability = {"status": reach.status, "functions": reach.functions, "present": reach.present, "network_facing": exposed}
                             reach_counts[reach.status] += 1
                             if reach.status == "not_present":
                                 reasons.append(
@@ -139,8 +142,33 @@ class CveAnalyzer(Analyzer):
                                 # symbol-presence guess that can be wrong.
                                 if not kev and severity is not Severity.CRITICAL:
                                     confidence = "low"
+                            elif exposed:
+                                # Present in a network-facing binary: the stronger
+                                # reachability signal. Annotated, never down-ranked.
+                                reach_counts["reachable_network_facing"] += 1
+                                reasons.append(f"vulnerable function(s) {', '.join(reach.present)} referenced in a network-facing binary")
                             else:
-                                reasons.append(f"binary references vulnerable function(s): {', '.join(reach.present)}")
+                                reasons.append(
+                                    f"binary references vulnerable function(s): {', '.join(reach.present)}; no network-facing "
+                                    "surface observed, so external reachability is less likely"
+                                )
+                            # Opt-in call-graph confirmation. Positive signal only:
+                            # a found path strengthens the finding; a missing path
+                            # never hides it (indirect/pointer calls defeat the graph).
+                            if ctx.deep_reachability and reach.status == "reachable":
+                                if not graph_done:
+                                    comp_graph = component_call_graph(comp.paths, ctx.inventory)
+                                    graph_done = True
+                                if comp_graph:
+                                    from_entry, from_input = function_reachable(comp_graph, set(reach.functions))
+                                    reachability["call_reachable_from_entry"] = from_entry
+                                    reachability["call_reachable_from_input"] = from_input
+                                    if from_input:
+                                        reasons.append("call-graph analysis confirms a path to it from external input")
+                                    elif from_entry:
+                                        reasons.append("call-graph analysis confirms it is reached from an entrypoint")
+                                    else:
+                                        reasons.append("call-graph analysis found no path from an entrypoint or external input (it may still be reached indirectly)")
                     metadata = {
                         "cve": cve,
                         "cvss_score": row["score"],

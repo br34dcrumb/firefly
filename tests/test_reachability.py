@@ -75,8 +75,9 @@ def test_component_symbols_reads_defined_functions(tmp_path):
     (root / "lib").mkdir(parents=True)
     (root / "lib" / "libz.so").write_bytes(_elf_defining("inflateGetHeader"))
     inv = Inventory.build(str(root))
-    observed, known = component_symbols(["lib/libz.so"], inv)
+    observed, known, exposed = component_symbols(["lib/libz.so"], inv)
     assert known and "inflateGetHeader" in observed
+    assert exposed is False  # a lib with no network imports or daemon-name path
 
 
 def _stripped_elf() -> bytes:
@@ -96,8 +97,8 @@ def test_component_symbols_unknown_for_stripped_binary(tmp_path):
     (root / "lib").mkdir(parents=True)
     (root / "lib" / "stripped.so").write_bytes(_stripped_elf())
     inv = Inventory.build(str(root))
-    observed, known = component_symbols(["lib/stripped.so"], inv)
-    assert observed == set() and known is False
+    observed, known, exposed = component_symbols(["lib/stripped.so"], inv)
+    assert observed == set() and known is False and exposed is False
 
 
 def test_component_symbols_unknown_when_no_elf(tmp_path):
@@ -105,8 +106,8 @@ def test_component_symbols_unknown_when_no_elf(tmp_path):
     (root / "etc").mkdir(parents=True)
     (root / "etc" / "motd").write_text("hello")
     inv = Inventory.build(str(root))
-    observed, known = component_symbols(["etc/motd"], inv)
-    assert observed == set() and known is False
+    observed, known, exposed = component_symbols(["etc/motd"], inv)
+    assert observed == set() and known is False and exposed is False
 
 
 class _FakeRec:
@@ -128,8 +129,9 @@ def test_component_symbols_imports_only_is_unknown(monkeypatch):
     info = ElfInfo(bits=32, endian="little", machine=0x28, etype=2,
                    imported_functions={"printf", "malloc"}, defined_functions=set(), stripped=True)
     monkeypatch.setattr("firefly.reachability.parse_file", lambda path, size: info)
-    observed, known = component_symbols(["usr/sbin/httpd"], _FakeInv())
+    observed, known, exposed = component_symbols(["usr/sbin/httpd"], _FakeInv())
     assert observed == {"printf", "malloc"} and known is False
+    assert exposed is True  # the httpd path hint marks it network-facing
 
 
 # --------------------------------------------------------------------------- analyzer integration
@@ -163,8 +165,24 @@ def test_reachable_cve_is_annotated_not_downranked(tmp_path):
     res = CveAnalyzer().run(ctx)
     hit = next(f for f in res.findings if f.metadata["cve"] == "CVE-2022-37434")
     assert hit.metadata["reachability"]["status"] == "reachable"
+    assert hit.metadata["reachability"]["network_facing"] is False  # a plain lib path
     assert hit.confidence == "high"  # vendor known, not down-ranked
     assert res.artifacts["reachability"]["reachable"] == 1
+
+
+def test_reachable_in_network_facing_binary_is_weighted(tmp_path):
+    # Same present function, but carried by a daemon-named binary: flagged as
+    # network-facing (the stronger reachability signal), still not down-ranked.
+    ctx = _ctx_with(tmp_path, {"usr/sbin/httpd": "inflateGetHeader"}, _zlib_db(tmp_path))
+    res = CveAnalyzer().run(ctx)
+    hit = next(f for f in res.findings if f.metadata["cve"] == "CVE-2022-37434")
+    assert hit.metadata["reachability"] == {
+        "status": "reachable", "functions": ["inflate", "inflateGetHeader"],
+        "present": ["inflateGetHeader"], "network_facing": True,
+    }
+    assert hit.confidence == "high"
+    assert any("network-facing binary" in r for r in hit.metadata["confidence_reasons"])
+    assert res.artifacts["reachability"]["reachable_network_facing"] == 1
 
 
 def test_absent_function_downranks_to_low(tmp_path):
@@ -175,6 +193,35 @@ def test_absent_function_downranks_to_low(tmp_path):
     assert hit.confidence == "low"
     assert any("absent from the matched binary" in r for r in hit.metadata["confidence_reasons"])
     assert res.artifacts["reachability"]["not_present"] == 1
+
+
+def test_deep_reachability_confirms_via_call_graph(tmp_path, monkeypatch):
+    # With --deep-reachability, a crafted call graph confirms a path to the
+    # vulnerable function from external input. radare2 itself is stubbed.
+    graph = {
+        "entry0": {"sym.main"},
+        "sym.main": {"sym.handler"},
+        "sym.handler": {"sym.imp.recv", "sym.inflateGetHeader"},
+    }
+    monkeypatch.setattr("firefly.disasm.call_graph", lambda path, **k: graph)
+    ctx = _ctx_with(tmp_path, {"lib/good.so": "inflateGetHeader"}, _zlib_db(tmp_path))
+    ctx.deep_reachability = True
+    res = CveAnalyzer().run(ctx)
+    hit = next(f for f in res.findings if f.metadata["cve"] == "CVE-2022-37434")
+    r = hit.metadata["reachability"]
+    assert r["call_reachable_from_input"] is True and r["call_reachable_from_entry"] is True
+    assert any("from external input" in reason for reason in hit.metadata["confidence_reasons"])
+
+
+def test_deep_reachability_degrades_when_radare2_absent(tmp_path, monkeypatch):
+    # radare2 unavailable -> no call-graph keys added, finding still stands.
+    monkeypatch.setattr("firefly.disasm.call_graph", lambda path, **k: None)
+    ctx = _ctx_with(tmp_path, {"lib/good.so": "inflateGetHeader"}, _zlib_db(tmp_path))
+    ctx.deep_reachability = True
+    res = CveAnalyzer().run(ctx)
+    hit = next(f for f in res.findings if f.metadata["cve"] == "CVE-2022-37434")
+    assert "call_reachable_from_input" not in hit.metadata["reachability"]
+    assert hit.metadata["reachability"]["status"] == "reachable"
 
 
 def test_kev_cve_is_not_hidden_when_absent(tmp_path):

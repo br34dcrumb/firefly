@@ -25,6 +25,8 @@ import json
 import os
 from dataclasses import dataclass
 
+from firefly import disasm
+from firefly.analyzers.hardening import is_network_facing
 from firefly.elf import parse_file
 
 _DEFAULT_PATH = os.path.join(os.path.dirname(__file__), "data", "cve_functions.json")
@@ -66,19 +68,27 @@ def classify(cve: str, product: str, observed: set[str], known: bool, table: dic
     return Reachability("reachable" if present else "not_present", list(funcs), present)
 
 
-def component_symbols(paths: list[str], inventory) -> tuple[set[str], bool]:
-    """Observed function names across a component's ELF binaries, and whether we
-    could actually see the binaries' *defined* functions.
+def component_symbols(paths: list[str], inventory) -> tuple[set[str], bool, bool]:
+    """Observed function names across a component's ELF binaries, whether we
+    could see the binaries' *defined* functions, and whether any binary is
+    network-facing.
 
     ``observed`` unions defined/exported names (symbol tables) and imported names
-    (dynamic undefined symbols). The second return value is True only when a full
+    (dynamic undefined symbols). ``defined_visible`` is True only when a full
     symbol table (``.symtab``) survived on at least one binary — i.e. we could
     enumerate its internal defined functions. Without that we must not conclude a
     function is absent: a stripped binary that merely imports libc, or whose
     local symbols were removed, would otherwise falsely read as not-present.
+
+    ``network_facing`` is True when any binary carrying the component speaks to
+    the network (by imported socket symbols or a daemon-name hint). A vulnerable
+    function present in a network-facing binary is more plausibly reachable from
+    external input than one present only in an offline helper — used to weight
+    the CVE finding, never to drop it.
     """
     observed: set[str] = set()
     defined_visible = False
+    network_facing = False
     for rel in paths:
         rec = inventory.get(rel)
         if rec is None or not rec.is_executable_code:
@@ -90,4 +100,28 @@ def component_symbols(paths: list[str], inventory) -> tuple[set[str], bool]:
         observed |= info.imported_functions
         if not info.stripped:
             defined_visible = True
-    return observed, defined_visible
+        if is_network_facing(rel, info.imported_functions):
+            network_facing = True
+    return observed, defined_visible, network_facing
+
+
+def component_call_graph(paths: list[str], inventory) -> dict[str, set[str]] | None:
+    """Merged radare2 call graph across a component's executable binaries.
+
+    None when radare2 is unavailable or analysis produced nothing — the caller
+    then simply omits the call-graph confirmation. Heavy (full analysis per
+    binary), so only invoked under ``--deep-reachability``.
+    """
+    merged: dict[str, set[str]] = {}
+    analysed = False
+    for rel in paths:
+        rec = inventory.get(rel)
+        if rec is None or not rec.is_executable_code:
+            continue
+        graph = disasm.call_graph(inventory.abspath(rec))
+        if graph is None:
+            continue
+        analysed = True
+        for caller, callees in graph.items():
+            merged.setdefault(caller, set()).update(callees)
+    return merged if analysed else None

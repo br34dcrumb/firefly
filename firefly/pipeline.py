@@ -38,6 +38,7 @@ class ScanOptions:
     db_path: str | None = None
     fpdb_path: str | None = None
     file_inventory: bool = True  # emit the per-file list in the report (enables file-level diff)
+    deep_reachability: bool = False  # confirm CVE reachability via radare2's call graph (opt-in, heavier)
     run_static: bool = True  # run the static analyzers (off for `firefly emulate`)
     emulate: bool = False  # opt-in dynamic emulation stage (executes binaries)
     emulate_timeout: float = 20.0
@@ -114,7 +115,7 @@ def scan(path: str, options: ScanOptions | None = None) -> ScanResult:
     file_strings.cache_clear()
 
     result = ScanResult(path, digest, size, workdir, started=_now())
-    ctx = ScanContext(firmware_path=path, workdir=workdir, jobs=max(1, options.jobs), db_path=options.db_path, fpdb_path=options.fpdb_path)
+    ctx = ScanContext(firmware_path=path, workdir=workdir, jobs=max(1, options.jobs), db_path=options.db_path, fpdb_path=options.fpdb_path, deep_reachability=options.deep_reachability)
 
     t0 = time.perf_counter()
     try:
