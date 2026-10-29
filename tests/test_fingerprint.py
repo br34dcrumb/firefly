@@ -60,6 +60,52 @@ def test_extract_function_hashes_the_code():
     assert sigs[0].hash == hashlib.sha256(code).hexdigest()[:32]
 
 
+def _elf_with_reloc(code: bytes, reloc_k: int | None = None) -> bytes:
+    """Like _elf_with_function (name 'fn'), optionally with one 32-bit RELA
+    entry whose r_offset points at byte `reloc_k` inside the function."""
+    ehsize, phentsize, shentsize = 52, 32, 40
+    phoff = ehsize
+    code_off = phoff + phentsize
+    strtab = b"\x00fn\x00"
+    strtab_off = code_off + len(code)
+    symtab_off = strtab_off + len(strtab)
+    sym_null = struct.pack("<IIIBBH", 0, 0, 0, 0, 0, 0)
+    sym_func = struct.pack("<IIIBBH", 1, VBASE + code_off, len(code), (1 << 4) | 2, 0, 1)
+    symtab = sym_null + sym_func
+    rela_off = symtab_off + len(symtab)
+    rela = struct.pack("<IIi", VBASE + code_off + reloc_k, 0, 0) if reloc_k is not None else b""
+    shoff = rela_off + len(rela)
+
+    def shdr(sh_type, off, size, link=0, entsize=0):
+        return struct.pack("<IIIIIIIIII", 0, sh_type, 0, 0, off, size, link, 0, 0, entsize)
+
+    shdrs = shdr(0, 0, 0) + shdr(3, strtab_off, len(strtab)) + shdr(2, symtab_off, len(symtab), link=1, entsize=16)
+    if rela:
+        shdrs += shdr(4, rela_off, len(rela), entsize=12)  # SHT_RELA
+    nshdr = 4 if rela else 3
+    total = shoff + len(shdrs)
+    phdr = struct.pack("<IIIIIIII", 1, 0, VBASE, VBASE, total, total, 5, 0x1000)
+    ident = b"\x7fELF" + bytes([1, 1, 1]) + bytes(9)
+    ehdr = ident + struct.pack("<HHIIIIIHHHHHH", 2, 0x28, 1, 0, phoff, shoff, 0, ehsize, phentsize, 1, shentsize, nshdr, 0)
+    blob = ehdr + phdr + code + strtab + symtab + rela + shdrs
+    assert len(blob) == total
+    return blob
+
+
+def test_relocation_masking_matches_differently_linked_builds():
+    base = bytes(range(32))
+    # two builds differ only in a 4-byte word at offset 8 (a relocated address)
+    a = base[:8] + b"\xaa\xaa\xaa\xaa" + base[12:]
+    b = base[:8] + b"\xbb\xbb\xbb\xbb" + base[12:]
+    # control: with no relocation there, the differing word makes them mismatch
+    assert extract_functions(_elf_with_reloc(a))[0].hash != extract_functions(_elf_with_reloc(b))[0].hash
+    # with a relocation covering offset 8, that word is masked -> equal hashes
+    ra = extract_functions(_elf_with_reloc(a, reloc_k=8))[0].hash
+    rb = extract_functions(_elf_with_reloc(b, reloc_k=8))[0].hash
+    assert ra == rb
+    assert ra == hashlib.sha256(a[:8] + b"\x00\x00\x00\x00" + a[12:]).hexdigest()[:32]
+
+
 def test_extract_skips_tiny_functions():
     sigs = extract_functions(_elf_with_function("stub", b"\x90" * 8))  # below MIN_FUNC_BYTES
     assert sigs == []

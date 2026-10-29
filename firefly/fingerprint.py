@@ -27,10 +27,12 @@ STT_FUNC = 2
 SHN_UNDEF = 0
 SHN_LORESERVE = 0xFF00
 SHT_SYMTAB, SHT_DYNSYM = 2, 11
+SHT_RELA, SHT_REL = 4, 9
 PT_LOAD = 1
 
 MIN_FUNC_BYTES = 16  # skip PLT stubs and trivial thunks
 MAX_FUNCS = 200_000  # don't walk an absurd symbol count from a crafted header
+MAX_RELOCS = 500_000  # cap the relocation walk on a crafted header
 HASH_HEX = 32  # 128-bit prefix of the sha256 — plenty to avoid collisions
 
 
@@ -46,13 +48,48 @@ def _endian(b: int) -> str | None:
 
 
 def _normalize(code: bytes, machine: int) -> bytes:
-    """Hook for architecture-aware normalization (masking immediates/relocs).
+    """Hook for architecture-aware *instruction* normalization.
 
-    First increment: identity (exact-code matching). Normalized matching that
-    survives relocation and optimization differences needs a per-architecture
-    disassembler and is a later increment.
+    Still identity: masking immediates/registers to survive optimization and
+    compiler differences needs a per-architecture disassembler and is a later
+    increment. Relocation masking (which needs no disassembler) is handled
+    separately in :func:`_mask_relocations`.
     """
     return code
+
+
+def _relocation_offsets(data: bytes, e: str, is64: bool, sections: list) -> set[int]:
+    """Virtual addresses the linker patched, from the ELF relocation sections.
+
+    The same library linked at a different base (or with different symbol
+    addresses) differs only in these relocated words, so masking them before
+    hashing lets two such builds match. Each entry's first field is ``r_offset``;
+    for a linked image (ET_EXEC/ET_DYN, which is what firmware ships) that is a
+    virtual address, directly comparable to a function's address range.
+    """
+    offsets: set[int] = set()
+    word = e + ("Q" if is64 else "I")
+    for sh_type, sh_offset, sh_size, _sh_link, sh_entsize in sections:
+        if sh_type not in (SHT_REL, SHT_RELA) or not sh_entsize:
+            continue
+        for i in range(min(sh_size // sh_entsize, MAX_RELOCS)):
+            try:
+                offsets.add(struct.unpack_from(word, data, sh_offset + i * sh_entsize)[0])
+            except struct.error:
+                break
+    return offsets
+
+
+def _mask_relocations(code: bytes, func_vaddr: int, relocs: set[int], wordsize: int) -> bytes:
+    """Zero out the relocated words that fall inside this function's bytes."""
+    hits = [r for r in relocs if func_vaddr <= r < func_vaddr + len(code)]
+    if not hits:
+        return code
+    buf = bytearray(code)
+    for r in hits:
+        start = r - func_vaddr
+        buf[start : start + wordsize] = b"\x00" * min(wordsize, len(buf) - start)
+    return bytes(buf)
 
 
 def extract_functions(data: bytes) -> list[FunctionSig]:
@@ -84,6 +121,8 @@ def extract_functions(data: bytes) -> list[FunctionSig]:
     sections = _sections(data, e, is64, e_shoff, e_shentsize, e_shnum)
     if not sections:
         return []
+    relocs = _relocation_offsets(data, e, is64, sections)
+    wordsize = 8 if is64 else 4
 
     out: dict[tuple[str, str], FunctionSig] = {}
     for sh_type, sh_offset, sh_size, sh_link, sh_entsize in sections:
@@ -101,7 +140,11 @@ def extract_functions(data: bytes) -> list[FunctionSig]:
             off = _vaddr_to_offset(value, loads)
             if off is None or off + size > len(data):
                 continue
-            code = _normalize(data[off : off + size], machine)
+            # Mask relocated words (no disassembler needed) before the
+            # instruction-normalization hook, so a differently-linked build of
+            # the same function still hashes the same.
+            code = _mask_relocations(data[off : off + size], value, relocs, wordsize)
+            code = _normalize(code, machine)
             h = hashlib.sha256(code).hexdigest()[:HASH_HEX]
             out[(name, h)] = FunctionSig(name=name, size=size, hash=h)
     return list(out.values())
