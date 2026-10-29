@@ -269,6 +269,7 @@ def _run_dynamic(result: ScanResult, ctx: ScanContext, options: ScanOptions) -> 
             reliable_open_ports,
         )
         from firefly.emulation.crawl import crawl_surface
+        from firefly.emulation.auth import AuthOptions, run_auth, upgrade_static_findings
 
         assert ctx.extraction is not None and ctx.inventory is not None
         sys_opts = SystemOptions(
@@ -298,13 +299,18 @@ def _run_dynamic(result: ScanResult, ctx: ScanContext, options: ScanOptions) -> 
             res.booted, res.boot_reason = target.booted, target.boot_reason
             if res.open_ports and not res.booted:
                 res.booted, res.boot_reason = True, "services responded on forwarded ports"
-            # Crawl while the guest is still alive.
+            # Crawl the surface and confirm credentials while the guest is alive.
             surface = crawl_surface(target, res.open_ports, COMMON_PORTS)
+            auth = run_auth(target, res.open_ports, COMMON_PORTS, result.findings, AuthOptions())
 
         result.findings.extend(res.to_findings())
         result.artifacts["system_emulation"] = res.to_artifact()
         result.findings.extend(surface.to_findings())
         result.artifacts["surface"] = surface.to_artifact()
+        result.findings.extend(auth.to_findings())
+        result.artifacts["auth"] = auth.to_artifact()
+        # Positive signal: a confirmed login upgrades the related static finding.
+        upgrade_static_findings(result.findings, auth.confirmations)
         if not res.booted:
             result.warnings.append(f"dynamic testing: {res.boot_reason}")
     except Exception as exc:  # dynamic failure must not lose the scan
