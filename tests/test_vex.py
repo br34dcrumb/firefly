@@ -7,7 +7,7 @@ from firefly.models import Component, Finding, Severity
 from firefly.pipeline import ScanResult
 
 
-def _result(finding: Finding) -> dict:
+def _result(finding: Finding, extra: list[Finding] | None = None) -> dict:
     comp = Component(product="zlib", version="1.2.11", vendor="zlib", paths=["lib/libz.so"])
     res = ScanResult(
         input_path="/fw/router.bin",
@@ -16,10 +16,16 @@ def _result(finding: Finding) -> dict:
         workdir="x",
         started="t",
         components=[comp],
-        findings=[finding],
+        findings=[finding, *(extra or [])],
     )
     bom = sbom.build(res)
     return next(v for v in bom["vulnerabilities"] if v["id"] == finding.metadata["cve"])
+
+
+def _crash_finding(path="lib/libz.so"):
+    """A harness-fuzzer crash finding on the given binary (what Phase C emits)."""
+    return Finding(analyzer="harness", title="crashed", severity=Severity.CRITICAL, confidence="high",
+                   path=path, metadata={"confirmed_fuzz_crash": True, "repro_b64": "eA=="})
 
 
 def _cve_finding(cve="CVE-2022-37434", *, severity=Severity.HIGH, confidence="high", reachability=None, reasons=None, kev=False):
@@ -82,3 +88,51 @@ def test_low_confidence_without_reachability_is_untriaged():
 def test_confident_match_without_reachability_has_no_analysis():
     vuln = _result(_cve_finding(confidence="high"))
     assert "analysis" not in vuln
+
+
+# --------------------------------------------------------------------------- Phase C dynamic confirmation
+
+
+def test_reachable_and_crashed_becomes_exploitable():
+    reach = {"status": "reachable", "functions": ["inflate"], "present": ["inflate"]}
+    vuln = _result(_cve_finding(reachability=reach), extra=[_crash_finding("lib/libz.so")])
+    assert vuln["analysis"]["state"] == "exploitable"
+    assert "crashed" in vuln["analysis"]["detail"] and "reproducer" in vuln["analysis"]["detail"]
+    assert {"name": "firefly:dynamic", "value": "crashed"} in vuln["properties"]
+
+
+def test_not_present_but_crashed_stays_in_triage_not_cleared():
+    # Symbols look absent, but the hosting binary was crashed: don't clear to
+    # not_affected — pull it back to in_triage.
+    reach = {"status": "not_present", "functions": ["inflate"], "present": []}
+    vuln = _result(_cve_finding(confidence="low", reachability=reach), extra=[_crash_finding("lib/libz.so")])
+    assert vuln["analysis"]["state"] == "in_triage"
+    assert "justification" not in vuln["analysis"]
+    assert "dynamically crashed" in vuln["analysis"]["detail"]
+
+
+def test_confident_match_crashed_becomes_in_triage():
+    # No reachability data, but the hosting binary was crashed -> surfaced, not silent.
+    vuln = _result(_cve_finding(confidence="high"), extra=[_crash_finding("lib/libz.so")])
+    assert vuln["analysis"]["state"] == "in_triage"
+    assert "dynamically crashed" in vuln["analysis"]["detail"]
+
+
+def test_crash_on_a_different_binary_does_not_escalate():
+    reach = {"status": "reachable", "functions": ["inflate"], "present": ["inflate"]}
+    vuln = _result(_cve_finding(reachability=reach), extra=[_crash_finding("usr/sbin/httpd")])
+    assert vuln["analysis"]["state"] == "in_triage"      # unchanged: crash was elsewhere
+    assert not any(p["name"] == "firefly:dynamic" for p in vuln["properties"])
+
+
+def test_network_and_cred_confirmations_do_not_touch_cve_vex():
+    # A network-fuzz crash and a confirmed login are service-level: they must not
+    # flip a CVE's VEX (only the per-binary harness crash does).
+    reach = {"status": "reachable", "functions": ["inflate"], "present": ["inflate"]}
+    netcrash = Finding(analyzer="fuzz", title="net crash", severity=Severity.HIGH, confidence="high",
+                       path=None, metadata={"port": 80, "kind": "console:Oops"})
+    cred = Finding(analyzer="accounts", title="empty password", severity=Severity.CRITICAL, confidence="high",
+                   path="lib/libz.so", metadata={"confirmed_login": True})
+    vuln = _result(_cve_finding(reachability=reach), extra=[netcrash, cred])
+    assert vuln["analysis"]["state"] == "in_triage"      # not exploitable
+    assert not any(p["name"] == "firefly:dynamic" for p in vuln["properties"])

@@ -18,7 +18,23 @@ def _component_type(paths: list[str]) -> str:
     return "library" if paths and all(".so" in os.path.basename(p) for p in paths) else "application"
 
 
-def _vex_analysis(finding: Finding) -> dict[str, Any] | None:
+def _dynamically_crashed_paths(findings: list[Finding]) -> set[str]:
+    """Binaries a Phase C / emulation stage *confirmed* crash on attacker input.
+
+    The per-binary harness fuzzer (`--fuzz-binaries`) and the bare-launch crashes
+    it upgrades both tag their finding with ``confirmed_fuzz_crash``; the binary
+    they name is one firmware executable demonstrably crashable on input. Network
+    and default-credential confirmations are service-level and are not mapped to a
+    specific CVE here (they remain their own findings) to avoid over-claiming.
+    """
+    crashed: set[str] = set()
+    for f in findings:
+        if f.path and f.analyzer in ("harness", "emulation") and f.metadata.get("confirmed_fuzz_crash"):
+            crashed.add(f.path)
+    return crashed
+
+
+def _vex_analysis(finding: Finding, crashed_paths: frozenset[str] | set[str] = frozenset()) -> dict[str, Any] | None:
     """CycloneDX VEX ``analysis`` block for a CVE finding, or None to omit it.
 
     Reachability (symbol presence) is turned into a machine-readable triage
@@ -27,20 +43,35 @@ def _vex_analysis(finding: Finding) -> dict[str, Any] | None:
     heuristic (inlining, stripping and static linking can hide a real function),
     so — matching the CVE analyzer's own caution — a known-exploited or critical
     CVE is never cleared this way; it stays ``in_triage`` for a human to confirm.
+
+    Phase C sharpens this: when the binary hosting the component was dynamically
+    *crashed on attacker-controlled input*, the state escalates. A reachable CVE
+    on a crashed binary becomes ``exploitable`` (symbols present **and** the
+    binary is proven input-reachable and memory-unsafe); a crashed binary whose
+    vulnerable symbols look absent is pulled back up to ``in_triage`` rather than
+    cleared. The detail is careful never to claim the crash is a PoC for this
+    specific CVE — only that the hosting binary is confirmed crashable.
     """
     meta = finding.metadata
     reach = meta.get("reachability")
+    crashed = bool(finding.path and finding.path in crashed_paths)
+    crash_note = (
+        f"The hosting binary {finding.path} was dynamically crashed on attacker-controlled input by "
+        "Firefly's harness fuzzer (reproducer recorded) — a confirmed input-reachable "
+        "memory-safety/DoS defect in that binary."
+    ) if crashed else ""
+
     if isinstance(reach, dict):
         status = reach.get("status")
         funcs = ", ".join(reach.get("functions") or [])
         if status == "not_present":
-            if meta.get("kev") or finding.severity is Severity.CRITICAL:
-                return {
-                    "state": "in_triage",
-                    "detail": f"vulnerable function(s) {funcs} appear absent from the matched binary, but "
+            if meta.get("kev") or finding.severity is Severity.CRITICAL or crashed:
+                detail = (
+                    f"vulnerable function(s) {funcs} appear absent from the matched binary, but "
                     "this CVE is known-exploited or critical — confirm manually (functions can be "
-                    "inlined, stripped, or statically linked).",
-                }
+                    "inlined, stripped, or statically linked)."
+                )
+                return {"state": "in_triage", "detail": f"{detail} {crash_note}".strip()}
             return {
                 "state": "not_affected",
                 "justification": "code_not_present",
@@ -49,10 +80,21 @@ def _vex_analysis(finding: Finding) -> dict[str, Any] | None:
             }
         if status == "reachable":
             present = ", ".join(reach.get("present") or [])
+            if crashed:
+                return {
+                    "state": "exploitable",
+                    "detail": f"binary references vulnerable function(s): {present}. {crash_note} "
+                    "Confirm whether this specific CVE is the trigger.",
+                }
             return {"state": "in_triage", "detail": f"binary references vulnerable function(s): {present}."}
     if finding.confidence == "low":
         # Keep doubtful matches visible to SBOM consumers, but as untriaged.
-        return {"state": "in_triage", "detail": "; ".join(meta.get("confidence_reasons", []))}
+        reasons = "; ".join(meta.get("confidence_reasons", []))
+        if crashed:
+            return {"state": "in_triage", "detail": f"{reasons}. {crash_note}" if reasons else crash_note}
+        return {"state": "in_triage", "detail": reasons}
+    if crashed:
+        return {"state": "in_triage", "detail": f"confident CVE match with no symbol-level reachability analysis. {crash_note}"}
     return None
 
 
@@ -76,6 +118,7 @@ def build(result: ScanResult) -> dict[str, Any]:
             entry["licenses"] = [{"license": {"name": comp.license}}]
         components.append(entry)
 
+    crashed_paths = _dynamically_crashed_paths(result.findings)
     vulnerabilities = []
     for finding in result.findings:
         cve = finding.metadata.get("cve")
@@ -110,7 +153,9 @@ def build(result: ScanResult) -> dict[str, Any]:
         reach = finding.metadata.get("reachability")
         if isinstance(reach, dict) and reach.get("status"):
             vuln["properties"].append({"name": "firefly:reachability", "value": reach["status"]})
-        analysis = _vex_analysis(finding)
+        if finding.path and finding.path in crashed_paths:
+            vuln["properties"].append({"name": "firefly:dynamic", "value": "crashed"})
+        analysis = _vex_analysis(finding, crashed_paths)
         if analysis is not None:
             vuln["analysis"] = analysis
         if finding.metadata.get("kev"):
