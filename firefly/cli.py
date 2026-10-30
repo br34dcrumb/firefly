@@ -39,6 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
     scan.add_argument("--emulate-system", action="store_true", help="also attempt a full-system boot under qemu-system (Linux only)")
     scan.add_argument("--dynamic", action="store_true", help="dynamic testing on the live device: boot it (implies --emulate-system) and crawl its HTTP surface + confirm default creds (Linux only)")
     scan.add_argument("--fuzz", action="store_true", help="mutational network fuzzer against the booted device's ports (implies the full-system boot; Linux only; heavy)")
+    scan.add_argument("--fuzz-binaries", action="store_true", help="harness-fuzz the firmware's service/sink binaries under qemu-user, flagging input-triggered crashes with a reproducer (implies --emulate; Linux only; heavy)")
+    scan.add_argument("--fuzz-engine", choices=["auto", "stdlib", "afl++"], default="auto", help="binary-fuzzing engine: 'auto' uses AFL++ qemu-mode if installed else the stdlib loop (default: %(default)s)")
     _add_emulation_args(scan)
     _add_system_args(scan)
     scan.add_argument(
@@ -221,6 +223,8 @@ def _scan_command(args: argparse.Namespace) -> int:
         emulate_initrd=args.system_initrd,
         dynamic=args.dynamic,
         fuzz=args.fuzz,
+        fuzz_binaries=args.fuzz_binaries,
+        fuzz_engine=args.fuzz_engine,
     )
     result = scan(args.input, options)
     report_path = write_json(result)

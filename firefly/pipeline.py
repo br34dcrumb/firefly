@@ -49,6 +49,9 @@ class ScanOptions:
     emulate_sandbox: bool = True  # False == --no-emulate-sandbox
     emulate_shim: bool = False
     emulate_args: tuple[str, ...] = ()
+    # Phase C3 heavy: per-binary harness fuzzing (implies the emulation stage)
+    fuzz_binaries: bool = False
+    fuzz_engine: str = "auto"  # "auto" | "stdlib" | "afl++"
     # Phase B: full-system emulation
     emulate_system: bool = False
     emulate_system_timeout: float = 90.0
@@ -172,7 +175,7 @@ def scan(path: str, options: ScanOptions | None = None) -> ScanResult:
             if out.artifacts:
                 result.artifacts[analyzer.name] = out.artifacts
 
-    if options.emulate and ctx.inventory is not None and ctx.extraction is not None:
+    if (options.emulate or options.fuzz_binaries) and ctx.inventory is not None and ctx.extraction is not None:
         _run_emulation(result, ctx, options)
 
     if (options.dynamic or options.fuzz) and ctx.inventory is not None and ctx.extraction is not None:
@@ -196,14 +199,25 @@ def _run_emulation(result: ScanResult, ctx: ScanContext, options: ScanOptions) -
         from firefly.emulation import EmulationOptions, run_emulation
 
         assert ctx.extraction is not None and ctx.inventory is not None
+        # Binaries the static taint pass marks as having an input-reachable
+        # dangerous sink are the prime harness-fuzz targets (dangerfns findings
+        # already ran, before emulation).
+        sink_paths = tuple(dict.fromkeys(
+            f.path for f in result.findings
+            if f.analyzer == "dangerfns" and f.path
+            and f.metadata.get("taint", {}).get("input_reaches_sink")
+        ))
         emu_opts = EmulationOptions(
             timeout_s=options.emulate_timeout,
             max_binaries=options.emulate_max,
             jobs=options.jobs,
             require_sandbox=options.emulate_sandbox,
             args=tuple(options.emulate_args),
-            build_shim=options.emulate_shim,
+            build_shim=options.emulate_shim or options.fuzz_binaries,
             workdir=ctx.workdir,
+            fuzz_binaries=options.fuzz_binaries,
+            fuzz_engine=options.fuzz_engine,
+            fuzz_sink_paths=sink_paths,
         )
         emu = run_emulation(ctx.extraction.scan_root, ctx.inventory, emu_opts)
         result.findings.extend(emu.to_findings())
@@ -212,6 +226,9 @@ def _run_emulation(result: ScanResult, ctx: ScanContext, options: ScanOptions) -
             result.warnings.append(f"emulation skipped: {emu.reason}")
         elif emu.reason:
             result.warnings.append(f"emulation: {emu.reason}")
+        if emu.harness is not None and emu.harness.reason:
+            verb = "binary fuzzing skipped" if not emu.harness.available else "binary fuzzing"
+            result.warnings.append(f"{verb}: {emu.harness.reason}")
     except Exception as exc:  # emulation failure must not lose the scan
         log.debug("emulation stage failed", exc_info=True)
         result.errors.append({"stage": "emulation", "error": f"{type(exc).__name__}: {exc}", "traceback": traceback.format_exc()})

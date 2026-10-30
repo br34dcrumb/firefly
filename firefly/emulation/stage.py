@@ -48,6 +48,10 @@ class EmulationOptions:
     args: tuple[str, ...] = ()
     build_shim: bool = False  # cross-compile the interception shim if a toolchain exists
     workdir: str | None = None  # where built shims are written
+    # Phase C3 heavy: harness-fuzz healthy service/sink binaries (--fuzz-binaries)
+    fuzz_binaries: bool = False
+    fuzz_engine: str = "auto"  # "auto" | "stdlib" | "afl++"
+    fuzz_sink_paths: tuple[str, ...] = ()  # binaries with input-reachable sinks (from dangerfns)
 
 
 def _priority(rec: FileRecord) -> int:
@@ -138,4 +142,20 @@ def run_emulation(rootfs: str, inv: Inventory, options: EmulationOptions) -> Emu
     if candidates and not result.qemu_found:
         archs = sorted({r.elf.machine for r in candidates if r.elf})
         result.reason = f"no qemu-user program installed for the image's architecture(s): {', '.join(archs)}"
+
+    # Phase C3 heavy: harness-fuzz the healthy service/sink binaries, reusing the
+    # sandbox tier, qemu paths and shims this stage already resolved.
+    if options.fuzz_binaries and result.qemu_found:
+        from firefly.emulation.harness import HarnessOptions, run_harness
+
+        result.harness = run_harness(
+            rootfs, inv, result.runs,
+            tier=tier, policy=policy, qemu_found=result.qemu_found,
+            workdir=options.workdir, sink_paths=options.fuzz_sink_paths, shims=shims,
+            opts=HarnessOptions(
+                run_timeout_s=min(options.timeout_s, 10.0),
+                engine=options.fuzz_engine,
+                build_shim=options.build_shim,
+            ),
+        )
     return result

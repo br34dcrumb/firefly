@@ -31,6 +31,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from firefly.emulation.mutator import BAD_TOKENS as _BAD_TOKENS
+from firefly.emulation.mutator import mutate as _mutate
 from firefly.models import Finding, Severity
 
 log = logging.getLogger(__name__)
@@ -53,14 +55,6 @@ _SEEDS: dict[str | None, list[bytes]] = {
         b"\r\n",
     ],
 }
-
-# Classic trouble tokens a dumb mutator should try: format strings, traversal,
-# overflow fillers, NULs, huge/negative numbers.
-_BAD_TOKENS: tuple[bytes, ...] = (
-    b"%n" * 8, b"%s" * 16, b"%x" * 16,
-    b"../" * 16, b"A" * 512, b"\x00" * 16, b"\xff" * 16,
-    b"-1", b"99999999999999999999", b"\r\n" * 8, b"${" + b"A" * 16 + b"}",
-)
 
 # Serial-console strings that mean something crashed. Kernel-level markers are
 # treated as more severe than a service segfault.
@@ -147,36 +141,6 @@ class FuzzResult:
 
 
 # --------------------------------------------------------------------------- mutation
-
-
-def _mutate(seed: bytes, rng: random.Random, max_input: int) -> bytes:
-    data = bytearray(seed) or bytearray(b"A")
-    for _ in range(rng.randint(1, 6)):
-        if not data:
-            data = bytearray(b"A")
-        op = rng.randint(0, 5)
-        if op == 0:  # bit flip
-            i = rng.randrange(len(data))
-            data[i] ^= 1 << rng.randrange(8)
-        elif op == 1:  # random byte
-            data[rng.randrange(len(data))] = rng.randrange(256)
-        elif op == 2:  # splice in a trouble token
-            tok = rng.choice(_BAD_TOKENS)
-            i = rng.randrange(len(data) + 1)
-            data[i:i] = tok
-        elif op == 3 and len(data) > 1:  # delete a chunk
-            i = rng.randrange(len(data))
-            n = rng.randint(1, min(8, len(data) - i))
-            del data[i:i + n]
-        elif op == 4:  # duplicate a chunk
-            i = rng.randrange(len(data))
-            n = rng.randint(1, max(1, min(16, len(data) - i)))
-            data[i:i] = data[i:i + n]
-        else:  # append a trouble token
-            data += rng.choice(_BAD_TOKENS)
-        if len(data) > max_input:
-            del data[max_input:]
-    return bytes(data)
 
 
 def _crash_marker(text: str) -> str | None:

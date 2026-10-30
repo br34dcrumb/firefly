@@ -38,8 +38,16 @@ def run_binary(
     timeout_s: float = 20.0,
     shim_path: str | None = None,
     log_path: str | None = None,
+    input_bytes: bytes | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> BinaryRun:
-    """Execute ``rootfs/rel_path`` under qemu-user and return the outcome."""
+    """Execute ``rootfs/rel_path`` under qemu-user and return the outcome.
+
+    ``input_bytes`` is fed to the binary's stdin (the harness fuzzer uses this to
+    deliver a mutated input); when ``None`` stdin is ``/dev/null`` as before.
+    ``extra_env`` adds guest environment (e.g. CGI variables) on top of the
+    minimal default.
+    """
     args = list(args or [])
     run = BinaryRun(path=rel_path, arch=elf.machine, qemu=os.path.basename(qemu_path), args=args)
 
@@ -61,6 +69,10 @@ def run_binary(
 
     argv, preexec = build_command(tier, policy, rootfs, qemu_cmd, extra_ro=extra_ro, rw_binds=rw_binds)
 
+    env = {"PATH": "/bin:/sbin:/usr/bin:/usr/sbin", "HOME": "/tmp"}
+    if extra_env:
+        env.update(extra_env)
+
     start = time.perf_counter()
     try:
         # start_new_session puts the child in its own process group so that, on
@@ -69,12 +81,14 @@ def run_binary(
         # already contains those, but this also covers the rlimit-only tier.
         proc = subprocess.Popen(
             argv,
-            stdin=subprocess.DEVNULL,  # never let a binary block waiting on input
+            # stdin is a pipe only when we have an input to deliver; otherwise
+            # /dev/null, so a binary never blocks waiting on input.
+            stdin=subprocess.PIPE if input_bytes is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=rootfs,
             preexec_fn=preexec,  # type: ignore[arg-type]  # None on bwrap/Windows
-            env={"PATH": "/bin:/sbin:/usr/bin:/usr/sbin", "HOME": "/tmp"},
+            env=env,
             start_new_session=True,
         )
     except OSError as exc:
@@ -83,7 +97,7 @@ def run_binary(
         return run
 
     try:
-        stdout, stderr = proc.communicate(timeout=timeout_s)
+        stdout, stderr = proc.communicate(input=input_bytes, timeout=timeout_s)
     except subprocess.TimeoutExpired:
         _kill_group(proc)
         stdout, stderr = proc.communicate()

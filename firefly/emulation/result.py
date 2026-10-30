@@ -89,9 +89,13 @@ class EmulationResult:
     runs: list[BinaryRun] = field(default_factory=list)
     candidates: int = 0  # binaries selected for emulation
     skipped: int = 0  # candidates skipped (no qemu for arch, launch error)
+    # Phase C3 heavy: the per-binary harness-fuzz result, when `--fuzz-binaries`
+    # ran. Typed Any to avoid a result<->harness import cycle (harness imports
+    # this module); it is a firefly.emulation.harness.HarnessResult.
+    harness: Any = None
 
     def to_artifact(self) -> dict[str, Any]:
-        return {
+        art = {
             "available": self.available,
             "reason": self.reason,
             "sandbox": self.sandbox,
@@ -100,6 +104,9 @@ class EmulationResult:
             "skipped": self.skipped,
             "runs": [r.to_dict() for r in self.runs],
         }
+        if self.harness is not None:
+            art["harness"] = self.harness.to_artifact()
+        return art
 
     def to_findings(self) -> list[Finding]:
         findings: list[Finding] = []
@@ -146,4 +153,9 @@ class EmulationResult:
                         metadata={"command": cmd[:500], "qemu": run.qemu},
                     )
                 )
+        # Phase C3 heavy: input-triggered crashes the harness fuzzer found, plus
+        # the confirmation upgrade it applies to any matching bare-launch finding.
+        if self.harness is not None:
+            self.harness.upgrade_bare_launch(findings)
+            findings.extend(self.harness.to_findings())
         return findings
