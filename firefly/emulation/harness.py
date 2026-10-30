@@ -327,18 +327,19 @@ def _crash(rel_path: str, elf: ElfInfo, signal: str, engine: str, data: bytes, i
 # --------------------------------------------------------------------------- AFL++ engine
 
 
-def afl_argv(afl_fuzz: str, in_dir: str, out_dir: str, secs: int, qemu_path: str, rootfs: str, target: str) -> list[str]:
+def afl_argv(afl_fuzz: str, in_dir: str, out_dir: str, secs: int, target: str) -> list[str]:
     """The ``afl-fuzz`` command line for a one-shot, time-boxed qemu-mode run.
 
-    ``-Q`` selects qemu-mode (foreign-architecture instrumentation via
-    ``afl-qemu-trace``); ``-V`` time-boxes the campaign; the target reads its
-    input on stdin (no ``@@``). ``-L -1``/``AFL_QEMU_PERSISTENT`` tuning is left
-    off on purpose — this stays a conservative, portable invocation.
+    ``-Q`` selects qemu-mode: AFL instruments and launches the *target binary*
+    itself through its bundled ``afl-qemu-trace`` — the target is passed directly
+    after ``--``, **not** wrapped in a ``qemu-user -L rootfs`` prefix (that is not
+    how ``-Q`` works and would make every run fail). The guest sysroot is given
+    out of band via ``QEMU_LD_PREFIX`` in the environment (see the runner).
+    ``-V`` time-boxes the campaign; the target reads its input on stdin (no
+    ``@@``). Persistent-mode tuning is left off on purpose — a conservative,
+    portable invocation.
     """
-    return [
-        afl_fuzz, "-Q", "-V", str(secs), "-i", in_dir, "-o", out_dir,
-        "--", qemu_path, "-L", rootfs, target,
-    ]
+    return [afl_fuzz, "-Q", "-V", str(secs), "-i", in_dir, "-o", out_dir, "--", target]
 
 
 def _write_seeds(in_dir: str) -> None:
@@ -385,7 +386,7 @@ def fuzz_binary_afl(
     workdir: str,
     opts: HarnessOptions,
     run_fn: Callable[..., BinaryRun] = run_binary,
-    afl_runner: Callable[[list[str], float], int] | None = None,
+    afl_runner: Callable[[list[str], float, dict], int] | None = None,
 ) -> tuple[list[HarnessCrash], int, str]:
     """Drive AFL++ qemu-mode over one binary, then confirm each crash it saved.
 
@@ -393,7 +394,8 @@ def fuzz_binary_afl(
     directory is replayed once through the qemu-user runner so the crash signal
     and shim triage come from the same path the stdlib engine uses. A reproducer
     that does not crash on replay is dropped (AFL's own crash detection can be
-    noisier than a clean signal). ``afl_runner`` is injectable for testing.
+    noisier than a clean signal). ``afl_runner`` is injectable for testing and is
+    called ``(argv, timeout_s, env)``.
     """
     afl_fuzz = shutil.which("afl-fuzz")
     if not afl_fuzz:
@@ -402,10 +404,19 @@ def fuzz_binary_afl(
     out_dir = os.path.join(workdir, "afl-out")
     shutil.rmtree(out_dir, ignore_errors=True)
     _write_seeds(in_dir)
-    argv = afl_argv(afl_fuzz, in_dir, out_dir, max(1, int(opts.wall_clock_s)), qemu_path, rootfs, os.path.join(rootfs, rel_path))
+    argv = afl_argv(afl_fuzz, in_dir, out_dir, max(1, int(opts.wall_clock_s)), os.path.join(rootfs, rel_path))
+    # qemu-mode finds the foreign-arch sysroot via QEMU_LD_PREFIX, and the AFL_*
+    # flags quiet its interactive gates for an unattended, bounded run.
+    env = dict(
+        os.environ,
+        QEMU_LD_PREFIX=rootfs,
+        AFL_SKIP_CPUFREQ="1",
+        AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES="1",
+        AFL_NO_AFFINITY="1",
+    )
     runner = afl_runner or _default_afl_runner
     try:
-        runner(argv, opts.wall_clock_s + 30.0)
+        runner(argv, opts.wall_clock_s + 30.0, env)
     except Exception as exc:  # AFL misconfiguration must never abort the scan
         log.debug("afl-fuzz failed for %s: %s", rel_path, exc)
         return [], 0, f"{rel_path}: afl-fuzz did not run ({type(exc).__name__})"
@@ -423,10 +434,9 @@ def fuzz_binary_afl(
     return crashes, len(crashes), ""
 
 
-def _default_afl_runner(argv: list[str], timeout_s: float) -> int:
-    """Run afl-fuzz, time-boxed. ``AFL_BENCH_UNTIL_CRASH`` would stop early but we
-    rely on ``-V`` and this hard timeout; the env quiets AFL's interactive gates."""
-    env = dict(os.environ, AFL_SKIP_CPUFREQ="1", AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES="1", AFL_NO_AFFINITY="1")
+def _default_afl_runner(argv: list[str], timeout_s: float, env: dict) -> int:
+    """Run afl-fuzz, time-boxed, with the caller's environment (QEMU_LD_PREFIX +
+    the AFL_* gates). ``-V`` plus this hard timeout bound the campaign."""
     try:
         proc = subprocess.run(argv, capture_output=True, timeout=timeout_s, env=env, check=False)
         return proc.returncode

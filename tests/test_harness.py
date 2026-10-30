@@ -148,12 +148,13 @@ def test_select_targets_prioritises_sinks_excludes_crashers_dedups():
 
 
 def test_afl_argv_shape():
-    argv = afl_argv("/usr/bin/afl-fuzz", "/in", "/out", 30, "/usr/bin/qemu-arm", "/root", "/root/usr/sbin/httpd")
+    argv = afl_argv("/usr/bin/afl-fuzz", "/in", "/out", 30, "/root/usr/sbin/httpd")
     assert argv[0] == "/usr/bin/afl-fuzz"
     assert "-Q" in argv and argv[argv.index("-V") + 1] == "30"
     assert argv[argv.index("-i") + 1] == "/in" and argv[argv.index("-o") + 1] == "/out"
     sep = argv.index("--")
-    assert argv[sep + 1:] == ["/usr/bin/qemu-arm", "-L", "/root", "/root/usr/sbin/httpd"]
+    # qemu-mode launches the target directly (sysroot via QEMU_LD_PREFIX) — no qemu/-L wrapper.
+    assert argv[sep + 1:] == ["/root/usr/sbin/httpd"]
 
 
 def test_collect_afl_crashes_reads_only_crash_ids(tmp_path):
@@ -173,8 +174,9 @@ def _afl_stub(repro: bytes):
     """A fake afl-fuzz: it 'finds' one crash by writing a reproducer into the
     -o dir it was handed, exactly where the real tool would (<out>/default/crashes)."""
     captured = {}
-    def run(argv, timeout):
+    def run(argv, timeout, env=None):
         captured["argv"] = argv
+        captured["env"] = env
         out_dir = argv[argv.index("-o") + 1]
         crashes = os.path.join(out_dir, "default", "crashes")
         os.makedirs(crashes, exist_ok=True)
@@ -199,6 +201,7 @@ def test_fuzz_binary_afl_confirms_and_triages(tmp_path, monkeypatch):
     assert crashes[0].engine == "afl++" and crashes[0].signal == "SIGSEGV"
     assert crashes[0].commands == ["system(evil)"]
     assert fake_afl.captured["argv"][0] == "/usr/bin/afl-fuzz"  # type: ignore[attr-defined]
+    assert fake_afl.captured["env"]["QEMU_LD_PREFIX"] == "/root"  # sysroot passed via env, not -L  # type: ignore[attr-defined]
 
 
 def test_fuzz_binary_afl_drops_unconfirmed_repro(tmp_path, monkeypatch):

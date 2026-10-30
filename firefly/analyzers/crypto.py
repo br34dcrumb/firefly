@@ -61,43 +61,59 @@ BOOT_MARKERS: dict[str, tuple[bytes, ...]] = {
 class _Bypass:
     label: str
     severity: Severity
-    patterns: tuple[bytes, ...]
+    pattern: "re.Pattern[bytes]"
     advice: str
 
 
-# Signs that a boot-integrity / secure-boot mechanism is disabled or bypassable.
-# Matched as bytes in bootloader environments, boot scripts and kernel-config
-# fragments. Conservative, specific byte strings to keep false positives low.
+# Signs that a boot-integrity / secure-boot mechanism is disabled or bypassable,
+# matched as bytes in bootloader environments, boot scripts and kernel-config
+# fragments. Each uses a leading boundary ((?:^|[^\w=/.-])) so a key like
+# `ssl_verify=no` does not match the U-Boot `verify=no`.
+_B = rb"(?:^|[^\w=/.-])"
 BYPASS_CHECKS: tuple[_Bypass, ...] = (
     _Bypass("U-Boot image verification disabled (verify=no)", Severity.HIGH,
-            (b"verify=no", b"verify = no"),
+            re.compile(_B + rb"verify\s*=\s*no\b"),
             "U-Boot is told not to verify image signatures, so unsigned kernel/FIT images will boot"),
     _Bypass("root shell at boot (init=/bin/sh)", Severity.HIGH,
-            (b"init=/bin/sh", b"init=/bin/bash", b"rdinit=/bin/sh"),
+            re.compile(_B + rb"(?:rd)?init\s*=\s*/bin/(?:ba)?sh\b"),
             "a boot argument drops straight to an unauthenticated root shell, bypassing the normal init"),
     _Bypass("IMA appraisal not enforced (ima_appraise=off/fix)", Severity.MEDIUM,
-            (b"ima_appraise=off", b"ima_appraise=fix"),
+            re.compile(_B + rb"ima_appraise\s*=\s*(?:off|fix)\b"),
             "IMA is present but not enforcing, so modified files are not blocked at access time"),
     _Bypass("secure boot explicitly disabled", Severity.MEDIUM,
-            (b"secure_boot=0", b"secureboot=off", b"CONFIG_SECURE_BOOT=n", b"SECURE_BOOT=n"),
+            re.compile(rb"(?:secure_?boot|CONFIG_SECURE_BOOT)\s*=\s*(?:0|off|n)\b", re.IGNORECASE),
             "a build or runtime flag turns verified boot off"),
 )
 
-# A non-negative U-Boot bootdelay leaves the boot interruptible at the console,
-# where bootargs can be edited to defeat verified boot (-1 disables the prompt).
-_BOOTDELAY_RE = re.compile(rb"bootdelay\s*=\s*(\d+)")
+# A U-Boot bootdelay of 1 or more leaves the boot interruptible at the console,
+# where bootargs can be edited to defeat verified boot. 0 (boot at once, no
+# prompt) and -1 (prompt disabled) are both excluded by matching only [1-9]\d*.
+_BOOTDELAY_RE = re.compile(rb"bootdelay\s*=\s*([1-9]\d*)")
 _FIT_SIG = (b"CONFIG_FIT_SIGNATURE=y", b"CONFIG_FIT_SIGNATURE=1")
 _FIT_MANDATORY = (b"CONFIG_FIT_SIGNATURE_MANDATORY",)
 
 # Shipping a seed file bakes the same entropy into every device; basenames only.
-SEED_FILENAMES = frozenset({"random-seed", "urandom-seed", "prng_seed", "entropy", ".rnd", "poolseed"})
+# Deliberately specific names — not the generic "entropy", which collides with
+# unrelated files and daemon state.
+SEED_FILENAMES = frozenset({"random-seed", "urandom-seed", "prng_seed", ".rnd", "poolseed"})
 
 MAX_FILE = 4 * 1024**2
 RSA_MIN_BITS = 2048
 
 
 def _scannable(rec) -> bool:
+    """Files worth parsing as certificates: typed, non-binary, bounded."""
     if rec.kind in (FileKind.SYMLINK, FileKind.OTHER, FileKind.ELF):
+        return False
+    return 0 < rec.size <= MAX_FILE
+
+
+def _marker_scannable(rec) -> bool:
+    """Files worth byte-scanning for boot/bypass markers — broader than
+    :func:`_scannable` because the usual carriers (a compiled ``boot.scr``, a
+    packed U-Boot env) are inventoried as ``OTHER``; only ELF (parsed separately)
+    and symlinks are excluded, still bounded by size."""
+    if rec.kind in (FileKind.SYMLINK, FileKind.ELF):
         return False
     return 0 < rec.size <= MAX_FILE
 
@@ -144,7 +160,7 @@ class CryptoAnalyzer(Analyzer):
                     legacy_paths.append(rec.path)
                 continue
 
-            if not _scannable(rec):
+            if not _marker_scannable(rec):
                 continue
             try:
                 with open(ctx.inventory.abspath(rec), "rb") as fh:
@@ -152,25 +168,26 @@ class CryptoAnalyzer(Analyzer):
             except OSError:
                 continue
 
-            for cert in x509.parse_certificates(data):
-                cert_count += 1
-                if cert.key_type == "rsa" and cert.key_bits is not None and cert.key_bits < RSA_MIN_BITS:
-                    weak_key.append(f"{rec.path} ({cert.key_bits}-bit RSA)")
-                if cert.weak_sig:
-                    weak_sig.append(f"{rec.path} ({cert.sig_alg})")
-                if cert.not_after is not None and cert.not_after < now:
-                    expired.append(f"{rec.path} (expired {cert.not_after.date().isoformat()})")
+            if _scannable(rec):  # certificates only in typed, non-binary files
+                for cert in x509.parse_certificates(data):
+                    cert_count += 1
+                    if cert.key_type == "rsa" and cert.key_bits is not None and cert.key_bits < RSA_MIN_BITS:
+                        weak_key.append(f"{rec.path} ({cert.key_bits}-bit RSA)")
+                    if cert.weak_sig:
+                        weak_sig.append(f"{rec.path} ({cert.sig_alg})")
+                    if cert.not_after is not None and cert.not_after < now:
+                        expired.append(f"{rec.path} (expired {cert.not_after.date().isoformat()})")
 
             for mechanism, markers in BOOT_MARKERS.items():
                 if mechanism not in boot_found and any(mk in data for mk in markers):
                     boot_found[mechanism] = rec.path
 
             for check in BYPASS_CHECKS:
-                if check.label not in bypass_found and any(p in data for p in check.patterns):
+                if check.label not in bypass_found and check.pattern.search(data):
                     bypass_found[check.label] = (rec.path, check.severity, check.advice)
             m = _BOOTDELAY_RE.search(data)
-            if m and "interruptible boot (non-negative U-Boot bootdelay)" not in bypass_found:
-                bypass_found["interruptible boot (non-negative U-Boot bootdelay)"] = (
+            if m and "interruptible boot (U-Boot bootdelay)" not in bypass_found:
+                bypass_found["interruptible boot (U-Boot bootdelay)"] = (
                     rec.path, Severity.MEDIUM,
                     f"bootdelay={m.group(1).decode()} leaves the boot interruptible at the console, where "
                     "bootargs can be edited to bypass verified boot (set bootdelay=-1 to disable the prompt)",

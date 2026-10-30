@@ -239,6 +239,27 @@ def test_predictable_seed_file_flagged(tmp_path):
     assert res.artifacts["predictable_seed_files"] == 1
 
 
+def test_bypass_scanned_in_binary_classified_file(tmp_path):
+    # A real boot.scr is a binary (mkimage header) classified OTHER, which the
+    # cert scan skips; marker scanning must still reach it.
+    content = b"\x27\x05\x19\x56\x00\x01\x02\x03" * 4 + b"setenv bootargs console=ttyS0 init=/bin/sh\x00\xff\xfe"
+    inv = _inv(tmp_path, {"boot/boot.scr": content})
+    res = CryptoAnalyzer().run(_ctx(inv))
+    assert _find(res, "root shell at boot") is not None
+
+
+def test_verify_no_does_not_match_ssl_verify(tmp_path):
+    inv = _inv(tmp_path, {"etc/curlrc": b"insecure\nssl_verify=no\ncacert=/etc/ca.pem\n"})
+    res = CryptoAnalyzer().run(_ctx(inv))
+    assert _find(res, "image verification disabled") is None   # ssl_verify=no is not U-Boot verify=no
+
+
+def test_bootdelay_zero_is_not_flagged(tmp_path):
+    inv = _inv(tmp_path, {"boot/uEnv.txt": b"bootdelay=0\n"})
+    res = CryptoAnalyzer().run(_ctx(inv))
+    assert _find(res, "interruptible boot") is None            # 0 means boot at once, no prompt
+
+
 def test_clean_image_has_no_bypass_or_seed(tmp_path):
     inv = _inv(tmp_path, {"etc/fstab": b"/dev/root / ext4 ro 0 1\n# dm-verity\n"})
     res = CryptoAnalyzer().run(_ctx(inv))

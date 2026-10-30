@@ -213,15 +213,17 @@ def _responsive(host: str, port: int, opts: FuzzOptions) -> bool:
 # --------------------------------------------------------------------------- fuzz loop
 
 
-def fuzz_service(host: str, port: int, service: str, console_fn: Callable[[], str], opts: FuzzOptions) -> tuple[list[Crash], int, str]:
+def fuzz_service(host: str, port: int, service: str, console_fn: Callable[[], str], opts: FuzzOptions, *, check_responsive: bool = True) -> tuple[list[Crash], int, str]:
     """Fuzz one service. Returns (crashes, iterations_run, skip_reason).
 
     ``console_fn`` returns the device's serial console so far; a crash marker
     appearing *after* the baseline, or the port going dead, ends the run with a
     recorded reproducer. ``port`` is the value stored on the crash (callers pass
     the guest port) while ``host:port`` is what is actually connected to.
+    ``check_responsive`` is False when the caller (``run_fuzz``) has already
+    verified the port is live, to avoid a redundant probe.
     """
-    if not _responsive(host, port, opts):
+    if check_responsive and not _responsive(host, port, opts):
         return [], 0, f"{service}/{port}: not responsive before fuzzing"
 
     baseline = len(console_fn())
@@ -308,6 +310,8 @@ def fuzz_service_boofuzz(
     console_fn: Callable[[], str],
     opts: FuzzOptions,
     driver: BoofuzzDriver | None = None,
+    *,
+    check_responsive: bool = True,
 ) -> tuple[list[Crash], int, bool]:
     """Structured-protocol fuzz of one service via boofuzz.
 
@@ -315,9 +319,10 @@ def fuzz_service_boofuzz(
     not drive the service at all, so the caller should fall back to the stdlib
     engine. Crash detection reuses the shared console-marker / port-death probe,
     so a boofuzz crash maps to exactly the same :class:`Crash` the stdlib engine
-    would produce (tagged ``engine="boofuzz"``).
+    would produce (tagged ``engine="boofuzz"``). ``check_responsive`` is False
+    when ``run_fuzz`` has already verified the port is live.
     """
-    if not _responsive(host, port, opts):
+    if check_responsive and not _responsive(host, port, opts):
         return [], 0, True  # ran (nothing to fuzz); caller records the skip like stdlib does
     baseline = len(console_fn())
 
@@ -422,13 +427,14 @@ def run_fuzz(target: Any, open_ports: list[int], services: dict[int, str], opts:
             res.skipped.append(f"{service}/{port}: not responsive before fuzzing")
             continue
 
+        # Responsiveness already checked above, so the engines skip their own probe.
         if engine == "boofuzz":
-            crashes, iters, ran = fuzz_service_boofuzz("127.0.0.1", host_port, service, console_fn, opts)
+            crashes, iters, ran = fuzz_service_boofuzz("127.0.0.1", host_port, service, console_fn, opts, check_responsive=False)
             if not ran:  # boofuzz could not drive this service at runtime -> stdlib
                 res.skipped.append(f"{service}/{port}: boofuzz unavailable at runtime, used stdlib")
-                crashes, iters, _skip = fuzz_service("127.0.0.1", host_port, service, console_fn, opts)
+                crashes, iters, _skip = fuzz_service("127.0.0.1", host_port, service, console_fn, opts, check_responsive=False)
         else:
-            crashes, iters, _skip = fuzz_service("127.0.0.1", host_port, service, console_fn, opts)
+            crashes, iters, _skip = fuzz_service("127.0.0.1", host_port, service, console_fn, opts, check_responsive=False)
 
         res.iterations += iters
         res.services_fuzzed.append(port)

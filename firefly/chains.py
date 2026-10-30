@@ -115,7 +115,11 @@ def _label(f: dict[str, Any], stage: str) -> str:
     meta = f.get("metadata") or {}
     base = f.get("path") or ""
     if stage == "entry":
-        return (f.get("title") or "exposed service").split(":")[0].strip()
+        title = f.get("title") or "exposed service"
+        # Keep the service name: "Insecure service: telnet" -> "exposed telnet".
+        if a == "services" and ":" in title:
+            return "exposed " + title.split(":", 1)[1].strip()
+        return title
     if a == "accounts":
         acct = meta.get("account")
         return f"login as {acct}" if acct else "weak account login"
