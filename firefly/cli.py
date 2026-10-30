@@ -117,6 +117,13 @@ def build_parser() -> argparse.ArgumentParser:
     comply.add_argument("-o", "--output", metavar="PATH", help="also write the coverage as JSON to this path")
     comply.add_argument("--json", action="store_true", help="print the coverage as JSON instead of a table")
     comply.add_argument("--min-confidence", choices=["low", "medium", "high"], default="medium", help="lowest finding confidence to include (default: %(default)s)")
+
+    chains = sub.add_parser("chains", help="correlate a scan report's findings into ranked attack chains (heuristic, not a proven exploit)")
+    chains.add_argument("report", help="path to a firefly.json scan report (or a directory containing one)")
+    chains.add_argument("-o", "--output", metavar="PATH", help="also write the chains as JSON to this path")
+    chains.add_argument("--json", action="store_true", help="print the chains as JSON instead of a table")
+    chains.add_argument("--max", type=int, default=20, metavar="N", help="maximum chains to report (default: %(default)s)")
+    chains.add_argument("--min-confidence", choices=["low", "medium", "high"], default="medium", help="lowest finding confidence to include (default: %(default)s)")
     return parser
 
 
@@ -173,6 +180,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "comply":
         return _comply_command(args)
+
+    if args.command == "chains":
+        return _chains_command(args)
 
     if args.command == "scan":
         return _scan_command(args)
@@ -416,6 +426,29 @@ def _comply_command(args: argparse.Namespace) -> int:
         compliance.print_coverage(coverage)
         if args.output:
             print(f"coverage: {args.output}")
+    return 0
+
+
+def _chains_command(args: argparse.Namespace) -> int:
+    import json
+
+    from firefly import chains, fwdiff
+
+    try:
+        report = fwdiff.load_report(args.report)
+    except fwdiff.DiffError as exc:
+        print(f"firefly: {exc}", file=sys.stderr)
+        return 2
+    result = chains.correlate(report, min_confidence=args.min_confidence, max_chains=args.max)
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as fh:
+            json.dump(result, fh, indent=2)
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        chains.print_chains(result)
+        if args.output:
+            print(f"chains: {args.output}")
     return 0
 
 
