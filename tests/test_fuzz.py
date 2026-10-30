@@ -19,9 +19,13 @@ from firefly.emulation.fuzz import (
     Crash,
     FuzzOptions,
     FuzzResult,
+    _build_boofuzz_request,
     _crash_marker,
     _mutate,
+    _request_spec,
+    detect_net_engine,
     fuzz_service,
+    fuzz_service_boofuzz,
     run_fuzz,
 )
 from firefly.models import Severity
@@ -181,4 +185,115 @@ def test_artifact_shape():
     art = res.to_artifact()
     assert art["iterations"] == 6 and art["services_fuzzed"] == [80]
     assert art["crashes"][0]["kind"] == "port-dead" and art["crashes"][0]["repro_b64"]
+    assert art["crashes"][0]["engine"] == "stdlib" and art["engine"] == "stdlib"
     assert art["skipped"]
+
+
+# --------------------------------------------------------------------------- boofuzz engine detection
+
+
+def test_detect_net_engine(monkeypatch):
+    monkeypatch.setattr(fuzz, "boofuzz_available", lambda: False)
+    assert detect_net_engine("stdlib") == ("stdlib", "")
+    assert detect_net_engine("auto") == ("stdlib", "")
+    engine, reason = detect_net_engine("boofuzz")      # forced but absent -> fall back
+    assert engine == "stdlib" and "boofuzz" in reason.lower()
+    monkeypatch.setattr(fuzz, "boofuzz_available", lambda: True)
+    assert detect_net_engine("auto") == ("boofuzz", "")
+    assert detect_net_engine("boofuzz") == ("boofuzz", "")
+
+
+def test_boofuzz_available_reflects_find_spec(monkeypatch):
+    monkeypatch.setattr(fuzz.importlib.util, "find_spec", lambda name: object())
+    assert fuzz.boofuzz_available() is True
+    monkeypatch.setattr(fuzz.importlib.util, "find_spec", lambda name: None)
+    assert fuzz.boofuzz_available() is False
+
+
+def test_request_spec_per_service():
+    assert _request_spec("ftp")[0] == ("static", b"USER ")
+    assert _request_spec("tr069") == _request_spec("upnp")     # SOAP spec shared
+    assert _request_spec("whatever") == _request_spec("http")  # unknown -> HTTP default
+    assert any(kind == "fuzz" for kind, _ in _request_spec("http"))
+
+
+def test_build_boofuzz_request_translates_spec():
+    # A duck-typed stand-in for the boofuzz module records what the builder asks for.
+    class FakeBz:
+        def __init__(self):
+            self.statics, self.fuzzes = [], []
+        def Static(self, name, default_value):
+            self.statics.append(default_value); return ("static", default_value)
+        def Bytes(self, name, default_value):
+            self.fuzzes.append(default_value); return ("fuzz", default_value)
+        def Request(self, name, children):
+            return {"name": name, "children": children}
+    bz = FakeBz()
+    req = _build_boofuzz_request(bz, [("static", b"GET "), ("fuzz", b"x"), ("static", b"\r\n")])
+    assert req["name"] == "req" and len(req["children"]) == 3
+    assert bz.statics == [b"GET ", b"\r\n"] and bz.fuzzes == [b"x"]
+
+
+# --------------------------------------------------------------------------- boofuzz service fuzzing (injected driver)
+
+
+def test_fuzz_service_boofuzz_finds_crash(tcp_server):
+    port = tcp_server.server_address[1]
+    def driver(host, p, spec, probe, opts):
+        return "console:Oops", b"PAYLOAD", 5
+    crashes, iters, ran = fuzz_service_boofuzz("127.0.0.1", port, "http", lambda: "", _OPTS, driver=driver)
+    assert ran and len(crashes) == 1
+    c = crashes[0]
+    assert c.kind == "console:Oops" and c.engine == "boofuzz"
+    assert base64.b64decode(c.repro_b64) == b"PAYLOAD"
+
+
+def test_fuzz_service_boofuzz_no_crash(tcp_server):
+    port = tcp_server.server_address[1]
+    crashes, iters, ran = fuzz_service_boofuzz("127.0.0.1", port, "http", lambda: "", _OPTS, driver=lambda *a: (None, None, 7))
+    assert ran and crashes == [] and iters == 7
+
+
+def test_fuzz_service_boofuzz_unavailable_signals_fallback(tcp_server):
+    port = tcp_server.server_address[1]
+    crashes, iters, ran = fuzz_service_boofuzz("127.0.0.1", port, "http", lambda: "", _OPTS, driver=lambda *a: (None, None, -1))
+    assert ran is False and crashes == []
+
+
+def test_fuzz_service_boofuzz_skips_dead_port():
+    crashes, iters, ran = fuzz_service_boofuzz("127.0.0.1", 1, "http", lambda: "", _OPTS, driver=lambda *a: (None, None, 9))
+    assert ran and crashes == [] and iters == 0   # driver never invoked on a dead port
+
+
+# --------------------------------------------------------------------------- boofuzz orchestration (via run_fuzz)
+
+
+def test_run_fuzz_boofuzz_engine_reports_crash(tcp_server, monkeypatch):
+    port = tcp_server.server_address[1]
+    monkeypatch.setattr(fuzz, "boofuzz_available", lambda: True)
+    monkeypatch.setattr(fuzz, "_default_boofuzz_driver", lambda *a: ("console:Kernel panic", b"BOOM", 3))
+    target = _StubTarget({80: port})
+    res = run_fuzz(target, [80], {80: "http"}, FuzzOptions(engine="boofuzz", connect_timeout_s=0.5, io_timeout_s=0.3))
+    assert res.engine == "boofuzz" and len(res.crashes) == 1
+    assert res.crashes[0].port == 80 and res.crashes[0].engine == "boofuzz"
+
+
+def test_run_fuzz_boofuzz_falls_back_to_stdlib(tcp_server, monkeypatch):
+    port = tcp_server.server_address[1]
+    monkeypatch.setattr(fuzz, "boofuzz_available", lambda: True)
+    monkeypatch.setattr(fuzz, "_default_boofuzz_driver", lambda *a: (None, None, -1))  # boofuzz can't run
+    target = _StubTarget({80: port})  # healthy; stdlib finds no crash
+    res = run_fuzz(target, [80], {80: "http"}, FuzzOptions(engine="boofuzz", iterations=3, connect_timeout_s=0.5, io_timeout_s=0.3))
+    assert res.engine == "boofuzz"               # engine attempted
+    assert res.services_fuzzed == [80]           # stdlib still fuzzed it
+    assert any("used stdlib" in s for s in res.skipped)
+
+
+def test_run_fuzz_stdlib_engine_forced_ignores_boofuzz(tcp_server, monkeypatch):
+    port = tcp_server.server_address[1]
+    monkeypatch.setattr(fuzz, "boofuzz_available", lambda: True)  # available, but...
+    # If boofuzz were used this would raise (no real driver); forcing stdlib must not call it.
+    monkeypatch.setattr(fuzz, "_default_boofuzz_driver", lambda *a: (_ for _ in ()).throw(AssertionError("boofuzz used")))
+    target = _StubTarget({80: port})
+    res = run_fuzz(target, [80], {80: "http"}, FuzzOptions(engine="stdlib", iterations=2, connect_timeout_s=0.5, io_timeout_s=0.3))
+    assert res.engine == "stdlib" and res.services_fuzzed == [80]

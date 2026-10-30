@@ -64,7 +64,8 @@ class ScanOptions:
     emulate_initrd: str | None = None
     # Phase C: dynamic testing on the live device (implies full-system boot)
     dynamic: bool = False  # C1 surface crawl + C2 auth confirmation on the booted device
-    fuzz: bool = False  # C3 mutational network fuzzer against the booted device's ports
+    fuzz: bool = False  # C3 network fuzzer against the booted device's ports
+    fuzz_net_engine: str = "auto"  # "auto" | "stdlib" | "boofuzz"
 
 
 @dataclass
@@ -326,7 +327,7 @@ def _run_dynamic(result: ScanResult, ctx: ScanContext, options: ScanOptions) -> 
                 surface = crawl_surface(target, res.open_ports, COMMON_PORTS)
                 auth = run_auth(target, res.open_ports, COMMON_PORTS, result.findings, AuthOptions())
             if options.fuzz:
-                fuzz = run_fuzz(target, res.open_ports, COMMON_PORTS, FuzzOptions())
+                fuzz = run_fuzz(target, res.open_ports, COMMON_PORTS, FuzzOptions(engine=options.fuzz_net_engine))
             res.console_tail = target.console  # refresh after the stages (fuzz may add crash output)
 
         result.findings.extend(res.to_findings())
