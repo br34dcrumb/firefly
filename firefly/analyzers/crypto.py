@@ -1,6 +1,6 @@
 """Cryptographic posture: weak primitives, certificate quality, secure boot.
 
-Three independent checks, all offline and failure-isolated:
+Checks, all offline and failure-isolated:
 
 * **Weak primitives** — which binaries reference broken ciphers/hashes (DES,
   RC4, MD4/MD2, ECB mode, and the legacy MD5/SHA-1 hashes), read from the ELF
@@ -9,7 +9,13 @@ Three independent checks, all offline and failure-isolated:
 * **Certificate quality** — small RSA keys, broken signature hashes and expired
   validity, via the dependency-free :mod:`firefly.x509` reader.
 * **Secure-boot posture** — whether any boot-integrity mechanism (dm-verity,
-  IMA/EVM, signed FIT images) is visible in the extracted filesystem.
+  IMA/EVM, signed FIT images) is visible in the extracted filesystem, **and**
+  whether it is *weakened or bypassed*: a bootloader/kernel configuration that
+  disables image verification, drops to a root shell, leaves IMA non-enforcing,
+  or ships FIT signing support without making it mandatory. Presence of a
+  mechanism that is then defeated is worse than its plain absence.
+* **Predictable entropy** — a random seed file shipped inside the image, which
+  gives every device the same "random" state at first boot.
 
 Hardcoded *private keys* are the credentials analyzer's job; this one judges the
 cryptography around them, and never handles a raw secret.
@@ -18,6 +24,8 @@ cryptography around them, and never handles a raw secret.
 from __future__ import annotations
 
 import os
+import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from firefly import x509
@@ -48,6 +56,42 @@ BOOT_MARKERS: dict[str, tuple[bytes, ...]] = {
     "signed FIT image": (b"key-name-hint", b"CONFIG_FIT_SIGNATURE"),
 }
 
+
+@dataclass(frozen=True)
+class _Bypass:
+    label: str
+    severity: Severity
+    patterns: tuple[bytes, ...]
+    advice: str
+
+
+# Signs that a boot-integrity / secure-boot mechanism is disabled or bypassable.
+# Matched as bytes in bootloader environments, boot scripts and kernel-config
+# fragments. Conservative, specific byte strings to keep false positives low.
+BYPASS_CHECKS: tuple[_Bypass, ...] = (
+    _Bypass("U-Boot image verification disabled (verify=no)", Severity.HIGH,
+            (b"verify=no", b"verify = no"),
+            "U-Boot is told not to verify image signatures, so unsigned kernel/FIT images will boot"),
+    _Bypass("root shell at boot (init=/bin/sh)", Severity.HIGH,
+            (b"init=/bin/sh", b"init=/bin/bash", b"rdinit=/bin/sh"),
+            "a boot argument drops straight to an unauthenticated root shell, bypassing the normal init"),
+    _Bypass("IMA appraisal not enforced (ima_appraise=off/fix)", Severity.MEDIUM,
+            (b"ima_appraise=off", b"ima_appraise=fix"),
+            "IMA is present but not enforcing, so modified files are not blocked at access time"),
+    _Bypass("secure boot explicitly disabled", Severity.MEDIUM,
+            (b"secure_boot=0", b"secureboot=off", b"CONFIG_SECURE_BOOT=n", b"SECURE_BOOT=n"),
+            "a build or runtime flag turns verified boot off"),
+)
+
+# A non-negative U-Boot bootdelay leaves the boot interruptible at the console,
+# where bootargs can be edited to defeat verified boot (-1 disables the prompt).
+_BOOTDELAY_RE = re.compile(rb"bootdelay\s*=\s*(\d+)")
+_FIT_SIG = (b"CONFIG_FIT_SIGNATURE=y", b"CONFIG_FIT_SIGNATURE=1")
+_FIT_MANDATORY = (b"CONFIG_FIT_SIGNATURE_MANDATORY",)
+
+# Shipping a seed file bakes the same entropy into every device; basenames only.
+SEED_FILENAMES = frozenset({"random-seed", "urandom-seed", "prng_seed", "entropy", ".rnd", "poolseed"})
+
 MAX_FILE = 4 * 1024**2
 RSA_MIN_BITS = 2048
 
@@ -75,8 +119,16 @@ class CryptoAnalyzer(Analyzer):
         expired: list[str] = []
         cert_count = 0
         boot_found: dict[str, str] = {}  # mechanism -> first path it was seen at
+        bypass_found: dict[str, tuple[str, Severity, str]] = {}  # label -> (path, severity, advice)
+        seed_paths: list[str] = []
+        fit_sig = fit_mandatory = False
 
         for rec in ctx.inventory:
+            # A shipped RNG seed file is predictable regardless of file type
+            # (a raw seed blob is usually inventoried as OTHER); never follow a symlink.
+            if rec.kind is not FileKind.SYMLINK and os.path.basename(rec.path).lower() in SEED_FILENAMES:
+                seed_paths.append(rec.path)
+
             if rec.kind is FileKind.ELF:
                 info = parse_file(ctx.inventory.abspath(rec), rec.size)
                 if info is None:
@@ -113,9 +165,31 @@ class CryptoAnalyzer(Analyzer):
                 if mechanism not in boot_found and any(mk in data for mk in markers):
                     boot_found[mechanism] = rec.path
 
+            for check in BYPASS_CHECKS:
+                if check.label not in bypass_found and any(p in data for p in check.patterns):
+                    bypass_found[check.label] = (rec.path, check.severity, check.advice)
+            m = _BOOTDELAY_RE.search(data)
+            if m and "interruptible boot (non-negative U-Boot bootdelay)" not in bypass_found:
+                bypass_found["interruptible boot (non-negative U-Boot bootdelay)"] = (
+                    rec.path, Severity.MEDIUM,
+                    f"bootdelay={m.group(1).decode()} leaves the boot interruptible at the console, where "
+                    "bootargs can be edited to bypass verified boot (set bootdelay=-1 to disable the prompt)",
+                )
+            fit_sig = fit_sig or any(s in data for s in _FIT_SIG)
+            fit_mandatory = fit_mandatory or any(s in data for s in _FIT_MANDATORY)
+
+        if fit_sig and not fit_mandatory:
+            bypass_found.setdefault(
+                "FIT signature supported but not mandatory (CONFIG_FIT_SIGNATURE_MANDATORY unset)",
+                (boot_found.get("signed FIT image", ""), Severity.MEDIUM,
+                 "FIT signature verification is compiled in but not required, so an unsigned image can still boot"),
+            )
+
         self._emit_primitives(result, prim, legacy_paths)
         self._emit_certs(result, weak_key, weak_sig, expired)
         self._emit_boot(result, boot_found)
+        self._emit_bypass(result, bypass_found, bool(boot_found))
+        self._emit_seed(result, seed_paths)
 
         result.artifacts = {
             "weak_primitive_families": sorted(prim),
@@ -125,6 +199,8 @@ class CryptoAnalyzer(Analyzer):
             "weak_cert_signatures": len(weak_sig),
             "expired_certs": len(expired),
             "boot_integrity": sorted(boot_found),
+            "secure_boot_bypass": sorted(bypass_found),
+            "predictable_seed_files": len(seed_paths),
         }
         return result
 
@@ -211,6 +287,50 @@ class CryptoAnalyzer(Analyzer):
                     metadata={"certificates": sorted(expired)},
                 )
             )
+
+    def _emit_bypass(self, result: AnalyzerResult, bypass_found: dict[str, tuple[str, Severity, str]], mechanism_present: bool) -> None:
+        for label in sorted(bypass_found):
+            path, severity, advice = bypass_found[label]
+            # A mechanism that is present but defeated is worse than its absence.
+            if mechanism_present and severity is Severity.MEDIUM:
+                severity = Severity.HIGH
+            result.findings.append(
+                Finding(
+                    analyzer=self.name,
+                    # "boot-integrity" in the title routes this to the right
+                    # compliance category (integrity / secure update).
+                    title=f"Secure-boot / boot-integrity weakened: {label}",
+                    severity=severity,
+                    confidence="medium",
+                    path=path or None,
+                    description=(
+                        f"{advice}. "
+                        + ("A boot-integrity mechanism is present but this defeats it. " if mechanism_present else "")
+                        + "This was read from a shipped configuration/script; confirm it is the active boot path."
+                    ),
+                    metadata={"weakness": label, "secure_boot": True, "mechanism_present": mechanism_present},
+                )
+            )
+
+    def _emit_seed(self, result: AnalyzerResult, seed_paths: list[str]) -> None:
+        if not seed_paths:
+            return
+        result.findings.append(
+            Finding(
+                analyzer=self.name,
+                title=f"Predictable RNG seed shipped in the image ({len(seed_paths)} file(s))",
+                severity=Severity.MEDIUM,
+                confidence="medium",
+                path=sorted(seed_paths)[0],
+                description=(
+                    "A random-seed file is baked into the firmware image, so every device starts with the "
+                    "same entropy pool at first boot — keys, nonces and session tokens generated before fresh "
+                    "entropy is gathered are predictable. The seed should be generated per-device at first boot, "
+                    "not shipped. See metadata for the full list."
+                ),
+                metadata={"seed_files": sorted(seed_paths)},
+            )
+        )
 
     def _emit_boot(self, result: AnalyzerResult, boot_found: dict[str, str]) -> None:
         if boot_found:

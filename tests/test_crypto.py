@@ -181,3 +181,66 @@ def test_boot_integrity_absent_posture(tmp_path):
     res = CryptoAnalyzer().run(_ctx(inv))
     f = _find(res, "No boot-integrity mechanism detected")
     assert f is not None and f.severity.value == "low" and f.confidence == "low"
+
+
+# --------------------------------------------------------------------------- secure-boot bypass / seeds
+
+
+def test_verify_no_is_high_bypass(tmp_path):
+    inv = _inv(tmp_path, {"boot/uboot.env": b"baudrate=115200\nverify=no\nbootcmd=bootm\n"})
+    res = CryptoAnalyzer().run(_ctx(inv))
+    f = _find(res, "Secure-boot / boot-integrity weakened")
+    assert f is not None and f.severity.value == "high" and f.metadata["secure_boot"] is True
+    assert "verify=no" in f.title
+    assert "verify=no" in res.artifacts["secure_boot_bypass"][0] or any("verify=no" in b for b in res.artifacts["secure_boot_bypass"])
+
+
+def test_init_bin_sh_is_high_bypass(tmp_path):
+    inv = _inv(tmp_path, {"boot/boot.scr": b"setenv bootargs console=ttyS0 init=/bin/sh\n"})
+    res = CryptoAnalyzer().run(_ctx(inv))
+    f = _find(res, "root shell at boot")
+    assert f is not None and f.severity.value == "high"
+
+
+def test_bootdelay_non_negative_is_flagged_but_minus_one_is_not(tmp_path):
+    bad = CryptoAnalyzer().run(_ctx(_inv(tmp_path / "a", {"boot/uEnv.txt": b"bootdelay=3\n"})))
+    assert _find(bad, "interruptible boot") is not None
+    ok = CryptoAnalyzer().run(_ctx(_inv(tmp_path / "b", {"boot/uEnv.txt": b"bootdelay=-1\n"})))
+    assert _find(ok, "interruptible boot") is None
+
+
+def test_mechanism_present_bumps_medium_bypass_to_high(tmp_path):
+    # dm-verity is present but IMA is left non-enforcing: defeating a present
+    # mechanism is escalated from medium to high.
+    inv = _inv(tmp_path, {"etc/boot.conf": b"dm-verity=on\nima_appraise=off\n"})
+    res = CryptoAnalyzer().run(_ctx(inv))
+    f = _find(res, "IMA appraisal not enforced")
+    assert f is not None and f.severity.value == "high" and f.metadata["mechanism_present"] is True
+
+
+def test_fit_signature_not_mandatory_is_bypass(tmp_path):
+    inv = _inv(tmp_path, {"boot/.config": b"CONFIG_FIT_SIGNATURE=y\n"})
+    res = CryptoAnalyzer().run(_ctx(inv))
+    assert _find(res, "FIT signature supported but not mandatory") is not None
+
+
+def test_fit_signature_mandatory_has_no_bypass(tmp_path):
+    inv = _inv(tmp_path, {"boot/.config": b"CONFIG_FIT_SIGNATURE=y\nCONFIG_FIT_SIGNATURE_MANDATORY=y\n"})
+    res = CryptoAnalyzer().run(_ctx(inv))
+    assert _find(res, "FIT signature supported but not mandatory") is None
+
+
+def test_predictable_seed_file_flagged(tmp_path):
+    inv = _inv(tmp_path, {"var/lib/urandom/random-seed": b"\x00\x01\x02\x03" * 8, "etc/motd": b"hi\n"})
+    res = CryptoAnalyzer().run(_ctx(inv))
+    f = _find(res, "Predictable RNG seed")
+    assert f is not None and f.severity.value == "medium"
+    assert f.metadata["seed_files"] == ["var/lib/urandom/random-seed"]
+    assert res.artifacts["predictable_seed_files"] == 1
+
+
+def test_clean_image_has_no_bypass_or_seed(tmp_path):
+    inv = _inv(tmp_path, {"etc/fstab": b"/dev/root / ext4 ro 0 1\n# dm-verity\n"})
+    res = CryptoAnalyzer().run(_ctx(inv))
+    assert _find(res, "weakened") is None and _find(res, "Predictable RNG seed") is None
+    assert res.artifacts["secure_boot_bypass"] == [] and res.artifacts["predictable_seed_files"] == 0
